@@ -1,0 +1,2837 @@
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
+use std::time::Instant;
+
+use serde::Serialize;
+use serde_json::Value;
+use tracing::{debug, info};
+
+use crate::embedding::provider::EmbeddingProvider;
+use crate::error::{Error, Result};
+use crate::fts::FtsIndex;
+use crate::index::state::Index;
+use crate::index::types::ComputedFieldDiagnostic;
+use crate::links;
+
+/// Search mode controlling which retrieval signals are used.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    /// Both semantic (HNSW) and lexical (BM25) search, fused via RRF.
+    #[default]
+    Hybrid,
+    /// Semantic search only (embedding + HNSW).
+    Semantic,
+    /// Lexical search only (BM25 via Tantivy). No embedding API call needed.
+    Lexical,
+    /// Edge-based search: retrieve by semantic edges between documents.
+    Edge,
+}
+
+impl FromStr for SearchMode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "hybrid" => Ok(Self::Hybrid),
+            "semantic" => Ok(Self::Semantic),
+            "lexical" => Ok(Self::Lexical),
+            "edge" => Ok(Self::Edge),
+            other => Err(Error::Config(format!(
+                "unknown search mode '{other}': expected hybrid, semantic, lexical, or edge"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for SearchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hybrid => write!(f, "hybrid"),
+            Self::Semantic => write!(f, "semantic"),
+            Self::Lexical => write!(f, "lexical"),
+            Self::Edge => write!(f, "edge"),
+        }
+    }
+}
+
+/// Sort direction for collection rows (and any future ordered listing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    /// Ascending order (smallest / earliest first).
+    #[default]
+    Asc,
+    /// Descending order (largest / latest first).
+    Desc,
+}
+
+impl FromStr for SortOrder {
+    type Err = Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "asc" | "ascending" => Ok(Self::Asc),
+            "desc" | "descending" => Ok(Self::Desc),
+            other => Err(Error::Config(format!(
+                "unknown sort order '{other}': expected asc or desc"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for SortOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Asc => write!(f, "asc"),
+            Self::Desc => write!(f, "desc"),
+        }
+    }
+}
+
+/// Builder-pattern query for semantic search.
+#[derive(Debug, Clone)]
+pub struct SearchQuery {
+    /// Natural-language query string.
+    pub query: String,
+    /// Maximum number of results to return.
+    pub limit: usize,
+    /// Minimum cosine similarity score (0.0–1.0).
+    pub min_score: f64,
+    /// Metadata filters applied with AND logic.
+    pub filters: Vec<MetadataFilter>,
+    /// Per-query override for link boosting (None = use config default).
+    pub boost_links: Option<bool>,
+    /// Search mode: hybrid, semantic, or lexical.
+    pub mode: SearchMode,
+    /// Optional path prefix to restrict results to a directory subtree.
+    pub path_prefix: Option<String>,
+    /// Per-query override for time decay (None = use config default).
+    pub decay: Option<bool>,
+    /// Per-query override for decay half-life in days (None = use config default).
+    pub decay_half_life: Option<f64>,
+    /// Per-query override for decay exclude patterns (None = use config default).
+    pub decay_exclude: Option<Vec<String>>,
+    /// Per-query override for decay include patterns (None = use config default).
+    pub decay_include: Option<Vec<String>>,
+    /// Per-query override for link boost hop depth (None = use config default).
+    pub boost_hops: Option<usize>,
+    /// Per-query override for graph context expansion depth (None = use config default).
+    pub expand_graph: Option<usize>,
+    /// Resolve frontmatter relations on each result file (depth 1). Applied by
+    /// the `MarkdownVdb::search` wrapper as post-processing; the engine ignores it.
+    pub populate: bool,
+}
+
+impl SearchQuery {
+    /// Create a new search query with sensible defaults (limit=10, min_score=0.0, no filters).
+    pub fn new(query: impl Into<String>) -> Self {
+        Self {
+            query: query.into(),
+            limit: 10,
+            min_score: 0.0,
+            filters: Vec::new(),
+            boost_links: None,
+            mode: SearchMode::default(),
+            path_prefix: None,
+            decay: None,
+            decay_half_life: None,
+            decay_exclude: None,
+            decay_include: None,
+            boost_hops: None,
+            expand_graph: None,
+            populate: false,
+        }
+    }
+
+    /// Set the maximum number of results to return.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Set the minimum cosine similarity score threshold.
+    pub fn with_min_score(mut self, min_score: f64) -> Self {
+        self.min_score = min_score;
+        self
+    }
+
+    /// Restrict results to files under the given path prefix.
+    pub fn with_path_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.path_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Add a metadata filter (multiple filters use AND logic).
+    pub fn with_filter(mut self, filter: MetadataFilter) -> Self {
+        self.filters.push(filter);
+        self
+    }
+
+    /// Enable or disable link-graph boosting for this query.
+    pub fn with_boost_links(mut self, boost: bool) -> Self {
+        self.boost_links = Some(boost);
+        self
+    }
+
+    /// Set the search mode (hybrid, semantic, or lexical).
+    pub fn with_mode(mut self, mode: SearchMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Enable or disable time decay for this query.
+    pub fn with_decay(mut self, decay: bool) -> Self {
+        self.decay = Some(decay);
+        self
+    }
+
+    /// Set the time decay half-life in days for this query.
+    pub fn with_decay_half_life(mut self, days: f64) -> Self {
+        self.decay_half_life = Some(days);
+        self
+    }
+
+    /// Set path prefixes excluded from time decay for this query.
+    pub fn with_decay_exclude(mut self, patterns: Vec<String>) -> Self {
+        self.decay_exclude = Some(patterns);
+        self
+    }
+
+    /// Set path prefixes where time decay applies (whitelist) for this query.
+    pub fn with_decay_include(mut self, patterns: Vec<String>) -> Self {
+        self.decay_include = Some(patterns);
+        self
+    }
+
+    /// Set the link boost hop depth for this query (1–3).
+    pub fn with_boost_hops(mut self, hops: usize) -> Self {
+        self.boost_hops = Some(hops);
+        self
+    }
+
+    /// Set the graph context expansion depth for this query (0–3).
+    pub fn with_expand_graph(mut self, depth: usize) -> Self {
+        self.expand_graph = Some(depth);
+        self
+    }
+
+    /// Enable relation populate: resolve frontmatter relations on result files.
+    pub fn with_populate(mut self, populate: bool) -> Self {
+        self.populate = populate;
+        self
+    }
+}
+
+/// Metadata filter for narrowing search results by frontmatter fields.
+#[derive(Debug, Clone)]
+pub enum MetadataFilter {
+    /// Exact value equality. If the field is an array, checks if the array contains the value.
+    Equals { field: String, value: Value },
+    /// Field value is in the provided list. If the field is an array, checks intersection.
+    In { field: String, values: Vec<Value> },
+    /// Numeric or lexicographic range comparison. Either bound may be omitted.
+    Range {
+        field: String,
+        min: Option<Value>,
+        max: Option<Value>,
+    },
+    /// Field exists in frontmatter and is not null.
+    Exists { field: String },
+}
+
+/// A single search result with relevance score, chunk content, and file context.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResult {
+    /// Relevance score (0.0–1.0, higher is more relevant).
+    ///
+    /// - **Semantic**: cosine similarity (absolute).
+    /// - **Lexical**: BM25 score normalized via saturation `score/(score+k)`.
+    /// - **Hybrid**: RRF score normalized by theoretical maximum.
+    pub score: f64,
+    /// The matched chunk.
+    pub chunk: SearchResultChunk,
+    /// File-level metadata for the chunk's source file.
+    pub file: SearchResultFile,
+}
+
+/// Chunk-level data within a search result.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResultChunk {
+    /// Chunk identifier (e.g. "path.md#0").
+    pub chunk_id: String,
+    /// Heading hierarchy leading to this chunk.
+    pub heading_hierarchy: Vec<String>,
+    /// The text content of this chunk.
+    pub content: String,
+    /// 1-based start line in the source file.
+    pub start_line: usize,
+    /// 1-based end line in the source file (inclusive).
+    pub end_line: usize,
+}
+
+/// File-level metadata within a search result.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResultFile {
+    /// Relative path to the source markdown file.
+    pub path: String,
+    /// Parsed frontmatter, if present.
+    pub frontmatter: Option<Value>,
+    /// Successful Formula values mirrored for module provenance/diagnostics.
+    /// `frontmatter` is the authoritative materialized source.
+    pub computed_fields: serde_json::Map<String, Value>,
+    /// Per-field calculation errors, keyed by computed field name.
+    pub computed_field_errors: std::collections::BTreeMap<String, ComputedFieldDiagnostic>,
+    /// File size in bytes.
+    pub file_size: u64,
+    /// Path split into components (e.g., `["docs", "api", "auth.md"]`).
+    pub path_components: Vec<String>,
+    /// Filesystem modification time as Unix timestamp, if available.
+    pub modified_at: Option<u64>,
+    /// Resolved frontmatter relations (populate only; key absent otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relations: Option<std::collections::BTreeMap<String, Vec<crate::relations::RelationValue>>>,
+}
+
+/// A graph context item representing a chunk from a file linked to a search result.
+///
+/// These are injected as supplementary context, separate from the ranked results,
+/// when graph context expansion is enabled.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphContextItem {
+    /// The matched chunk from the linked file.
+    pub chunk: SearchResultChunk,
+    /// File-level metadata for the linked file.
+    pub file: SearchResultFile,
+    /// Path of the result file this item is linked from.
+    pub linked_from: String,
+    /// Number of link hops from the result file (1 = direct link).
+    pub hop_distance: usize,
+    /// Contextual information about the edge connecting this item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_context: Option<String>,
+    /// Relationship type of the edge connecting this item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_relationship: Option<String>,
+}
+
+/// A search result representing a semantic edge between two documents.
+#[derive(Debug, Clone, Serialize)]
+pub struct EdgeSearchResult {
+    /// Relevance score for this edge match.
+    pub score: f64,
+    /// Unique identifier for this edge.
+    pub edge_id: String,
+    /// Source document path.
+    pub source_path: String,
+    /// Target document path.
+    pub target_path: String,
+    /// Link text connecting source to target.
+    pub link_text: String,
+    /// Contextual text surrounding the link.
+    pub context: String,
+    /// Relationship type label (e.g., "references", "extends").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship_type: Option<String>,
+    /// Cluster ID this edge belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<usize>,
+    /// Edge strength/weight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strength: Option<f64>,
+}
+
+/// Per-query timing breakdown for search operations.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchTimings {
+    /// Time spent calling the embedding provider to embed the query.
+    pub embed_secs: f64,
+    /// Time spent in HNSW vector search (usearch). 0 if lexical-only.
+    pub vector_search_secs: f64,
+    /// Time spent in BM25 lexical search (tantivy). 0 if semantic-only.
+    pub lexical_search_secs: f64,
+    /// Time spent in RRF fusion + score normalization. 0 if not hybrid.
+    pub fusion_secs: f64,
+    /// Time spent assembling results (filtering, decay, link boosting).
+    pub assemble_secs: f64,
+    /// Total wall-clock time.
+    pub total_secs: f64,
+}
+
+/// Wrapper response for search operations, containing ranked results,
+/// optional graph context items, and timing information.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResponse {
+    /// Ranked search results ordered by relevance score.
+    pub results: Vec<SearchResult>,
+    /// Supplementary chunks from linked files (graph context expansion).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub graph_context: Vec<GraphContextItem>,
+    /// Timing breakdown for the search operation.
+    pub timings: SearchTimings,
+    /// Edge-based search results (populated when mode is Edge).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub edge_results: Vec<EdgeSearchResult>,
+}
+
+/// Apply exponential time decay to a score based on file age.
+///
+/// Returns `score * 0.5^(elapsed_days / half_life_days)`.
+/// The multiplier is always in (0, 1], so the result is <= the input score.
+pub fn apply_time_decay(score: f64, modified_at: u64, half_life_days: f64, now: u64) -> f64 {
+    let elapsed_secs = now.saturating_sub(modified_at) as f64;
+    let elapsed_days = elapsed_secs / 86400.0;
+    let multiplier = 0.5_f64.powf(elapsed_days / half_life_days);
+    score * multiplier
+}
+
+/// Determines whether decay should be applied to a file at the given path.
+///
+/// Returns `false` if the path matches any exclude prefix (highest priority),
+/// or if the include list is non-empty and the path matches no include prefix.
+fn should_apply_decay(path: &str, exclude: &[String], include: &[String]) -> bool {
+    // Exclude takes precedence
+    if exclude
+        .iter()
+        .any(|scope| crate::path_util::path_is_in_scope(path, scope))
+    {
+        return false;
+    }
+    // If include is non-empty, path must match at least one
+    if !include.is_empty()
+        && !include
+            .iter()
+            .any(|scope| crate::path_util::path_is_in_scope(path, scope))
+    {
+        return false;
+    }
+    true
+}
+
+/// Execute a search query against the index, supporting hybrid, semantic, and lexical modes.
+///
+/// Pipeline varies by mode:
+/// - **Semantic**: embed → HNSW search → filter → assemble → truncate → boost → expand
+/// - **Lexical**: BM25 search → normalize → filter → assemble → truncate → boost → expand
+/// - **Hybrid**: semantic + lexical in parallel → RRF fusion → normalize → filter → assemble → truncate → boost → expand
+///
+/// When `fts_index` is `None` and mode is Hybrid or Lexical, falls back to semantic-only.
+///
+/// Returns a `SearchResponse` containing ranked results, optional graph context items
+/// (from linked files), and timing information.
+#[allow(clippy::too_many_arguments)]
+pub async fn search(
+    query: &SearchQuery,
+    index: &Index,
+    provider: &dyn EmbeddingProvider,
+    fts_index: Option<&FtsIndex>,
+    rrf_k: f64,
+    bm25_norm_k: f64,
+    decay_enabled: bool,
+    decay_half_life: f64,
+    decay_exclude: &[String],
+    decay_include: &[String],
+    boost_links_default: bool,
+    boost_hops_default: usize,
+    expand_graph_default: usize,
+    expand_limit: usize,
+    edge_boost_weight: f64,
+) -> Result<SearchResponse> {
+    let total_start = Instant::now();
+
+    // Validate: empty query is a no-op.
+    if query.query.trim().is_empty() || query.limit == 0 {
+        debug!("empty query, returning no results");
+        return Ok(SearchResponse {
+            results: Vec::new(),
+            graph_context: Vec::new(),
+            edge_results: Vec::new(),
+            timings: SearchTimings {
+                embed_secs: 0.0,
+                vector_search_secs: 0.0,
+                lexical_search_secs: 0.0,
+                fusion_secs: 0.0,
+                assemble_secs: 0.0,
+                total_secs: 0.0,
+            },
+        });
+    }
+
+    // Determine effective expand_graph (needed before candidate retrieval for lexical mode).
+    let effective_expand_graph = query.expand_graph.unwrap_or(expand_graph_default);
+
+    // Determine effective mode: fall back to semantic if no FTS index available.
+    let effective_mode = match query.mode {
+        SearchMode::Hybrid | SearchMode::Lexical if fts_index.is_none() => {
+            debug!(
+                requested = %query.mode,
+                "FTS index not available, falling back to semantic mode"
+            );
+            SearchMode::Semantic
+        }
+        mode => mode,
+    };
+
+    // Over-fetch to account for filtering. 5x for hybrid (RRF needs more
+    // candidates), 3x otherwise. Scoped searches widen this progressively
+    // below when the first global candidate window does not fill the limit.
+    let over_fetch = match effective_mode {
+        SearchMode::Hybrid => query.limit.saturating_mul(5),
+        _ => query.limit.saturating_mul(3),
+    };
+
+    // Track per-phase timing.
+    let mut embed_secs = 0.0_f64;
+    let mut vector_search_secs = 0.0_f64;
+    let mut lexical_search_secs = 0.0_f64;
+    let mut fusion_secs = 0.0_f64;
+
+    // Embed at most once. Progressive scoped retrieval reuses this vector.
+    let needs_embedding = effective_mode != SearchMode::Lexical || effective_expand_graph > 0;
+    let query_embedding: Option<Vec<f32>> = if needs_embedding {
+        let t0 = Instant::now();
+        let embeddings = provider
+            .embed_batch_for(
+                std::slice::from_ref(&query.query),
+                crate::embedding::provider::EmbeddingPurpose::Query,
+            )
+            .await?;
+        embed_secs = t0.elapsed().as_secs_f64();
+        Some(embeddings.into_iter().next().ok_or_else(|| {
+            Error::EmbeddingProvider("provider returned no query embedding".to_string())
+        })?)
+    } else {
+        None
+    };
+
+    let status = index.status();
+    let fts_document_count = match (effective_mode, fts_index) {
+        (SearchMode::Lexical | SearchMode::Hybrid, Some(fts)) => fts.num_docs()? as usize,
+        _ => 0,
+    };
+    let candidate_ceiling = match effective_mode {
+        SearchMode::Edge => status.edge_count,
+        SearchMode::Semantic => status.chunk_count,
+        SearchMode::Lexical => fts_document_count,
+        SearchMode::Hybrid => status.chunk_count.max(fts_document_count),
+    };
+    let mut candidate_limit = over_fetch.min(candidate_ceiling);
+
+    // --- Edge-first retrieval mode ---
+    if effective_mode == SearchMode::Edge {
+        let link_graph = index.get_link_graph();
+        let mut assemble_secs = 0.0_f64;
+        let mut edge_results = Vec::new();
+
+        loop {
+            if candidate_limit == 0 {
+                break;
+            }
+            let search_start = Instant::now();
+            let edge_candidates = index.search_edges(
+                require_query_embedding(query_embedding.as_deref())?,
+                candidate_limit,
+            )?;
+            vector_search_secs += search_start.elapsed().as_secs_f64();
+            let edge_assembly_start = Instant::now();
+            edge_results = assemble_edge_results(
+                &edge_candidates,
+                link_graph.as_ref(),
+                query.path_prefix.as_deref(),
+            );
+            edge_results.truncate(query.limit);
+            assemble_secs += edge_assembly_start.elapsed().as_secs_f64();
+
+            if edge_results.len() >= query.limit {
+                break;
+            }
+            let Some(next_limit) = widened_candidate_limit(candidate_limit, candidate_ceiling)
+            else {
+                break;
+            };
+            candidate_limit = next_limit;
+        }
+
+        let total_secs = total_start.elapsed().as_secs_f64();
+
+        info!(
+            query = %query.query,
+            edge_results = edge_results.len(),
+            mode = %effective_mode,
+            "edge search complete"
+        );
+
+        return Ok(SearchResponse {
+            results: Vec::new(),
+            graph_context: Vec::new(),
+            edge_results,
+            timings: SearchTimings {
+                embed_secs,
+                vector_search_secs,
+                lexical_search_secs,
+                fusion_secs,
+                assemble_secs,
+                total_secs,
+            },
+        });
+    }
+
+    // Resolve decay settings: per-query overrides take priority over config.
+    let should_decay = query.decay.unwrap_or(decay_enabled);
+    let effective_half_life = query.decay_half_life.unwrap_or(decay_half_life);
+    let effective_decay_exclude = query.decay_exclude.as_deref().unwrap_or(decay_exclude);
+    let effective_decay_include = query.decay_include.as_deref().unwrap_or(decay_include);
+    let effective_boost_links = query.boost_links.unwrap_or(boost_links_default);
+    let effective_boost_hops = query.boost_hops.unwrap_or(boost_hops_default);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Pre-compute link graph data once (used for both boost and expansion).
+    let link_graph = index.get_link_graph();
+    let backlinks = link_graph.as_ref().map(links::compute_backlinks);
+
+    // Retrieve, filter, and assemble results. If a scoped query is starved by
+    // globally higher-ranked candidates, double the window until the requested
+    // limit is filled or every candidate has been considered.
+    let mut assemble_secs = 0.0_f64;
+    let results = loop {
+        let mut ranked_candidates = match effective_mode {
+            SearchMode::Semantic => {
+                let search_start = Instant::now();
+                let candidates = if candidate_limit == 0 {
+                    Vec::new()
+                } else {
+                    index.search_vectors(
+                        require_query_embedding(query_embedding.as_deref())?,
+                        candidate_limit,
+                    )?
+                };
+                vector_search_secs += search_start.elapsed().as_secs_f64();
+                candidates
+            }
+            SearchMode::Lexical => {
+                let fts = fts_index.unwrap(); // safe: checked above
+                if candidate_limit == 0 {
+                    Vec::new()
+                } else {
+                    let (candidates, elapsed) = lexical_search(query, fts, candidate_limit)?;
+                    lexical_search_secs += elapsed;
+                    candidates
+                }
+            }
+            SearchMode::Hybrid => {
+                let fts = fts_index.unwrap(); // safe: checked above
+
+                let vector_start = Instant::now();
+                let semantic = if candidate_limit == 0 {
+                    Vec::new()
+                } else {
+                    index.search_vectors(
+                        require_query_embedding(query_embedding.as_deref())?,
+                        candidate_limit,
+                    )?
+                };
+                vector_search_secs += vector_start.elapsed().as_secs_f64();
+
+                let lexical = if candidate_limit == 0 {
+                    Vec::new()
+                } else {
+                    let (candidates, elapsed) = lexical_search(query, fts, candidate_limit)?;
+                    lexical_search_secs += elapsed;
+                    candidates
+                };
+
+                debug!(
+                    semantic_count = semantic.len(),
+                    lexical_count = lexical.len(),
+                    rrf_k = rrf_k,
+                    "fusing semantic and lexical results via RRF"
+                );
+                let fusion_start = Instant::now();
+                let fused = reciprocal_rank_fusion(&semantic, &lexical, rrf_k);
+                fusion_secs += fusion_start.elapsed().as_secs_f64();
+                fused
+            }
+            SearchMode::Edge => unreachable!("edge mode returns above"),
+        };
+
+        // Normalize scores to [0, 1] for non-semantic modes.
+        match effective_mode {
+            SearchMode::Lexical => normalize_bm25_scores(&mut ranked_candidates, bm25_norm_k),
+            SearchMode::Hybrid => normalize_rrf_scores(&mut ranked_candidates, rrf_k, 2),
+            SearchMode::Edge | SearchMode::Semantic => {}
+        }
+
+        debug!(
+            candidates = ranked_candidates.len(),
+            candidate_limit,
+            limit = query.limit,
+            mode = %effective_mode,
+            "search returned candidates"
+        );
+
+        let result_assembly_start = Instant::now();
+        let results = assemble_results(&AssembleParams {
+            query,
+            index,
+            candidates: &ranked_candidates,
+            decay_enabled: should_decay,
+            decay_half_life: effective_half_life,
+            decay_exclude: effective_decay_exclude,
+            decay_include: effective_decay_include,
+            boost_links: effective_boost_links,
+            boost_hops: effective_boost_hops,
+            link_graph: link_graph.as_ref(),
+            backlinks: backlinks.as_ref(),
+            now,
+            query_embedding: query_embedding.as_deref(),
+            edge_boost_weight,
+        })?;
+        assemble_secs += result_assembly_start.elapsed().as_secs_f64();
+
+        if query.path_prefix.is_none() || results.len() >= query.limit {
+            break results;
+        }
+        let Some(next_limit) = widened_candidate_limit(candidate_limit, candidate_ceiling) else {
+            break results;
+        };
+        candidate_limit = next_limit;
+    };
+
+    // Graph context expansion: find relevant chunks from linked files.
+    let graph_assembly_start = Instant::now();
+    let graph_context = if effective_expand_graph > 0 {
+        if let (Some(lg), Some(bl), Some(qe)) = (&link_graph, &backlinks, &query_embedding) {
+            expand_graph_context(
+                index,
+                &results,
+                qe,
+                lg,
+                bl,
+                effective_expand_graph,
+                expand_limit,
+            )
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    assemble_secs += graph_assembly_start.elapsed().as_secs_f64();
+
+    let total_secs = total_start.elapsed().as_secs_f64();
+
+    info!(
+        query = %query.query,
+        results = results.len(),
+        graph_context = graph_context.len(),
+        mode = %effective_mode,
+        "search complete"
+    );
+
+    let timings = SearchTimings {
+        embed_secs,
+        vector_search_secs,
+        lexical_search_secs,
+        fusion_secs,
+        assemble_secs,
+        total_secs,
+    };
+
+    Ok(SearchResponse {
+        results,
+        graph_context,
+        edge_results: Vec::new(),
+        timings,
+    })
+}
+
+fn widened_candidate_limit(current: usize, ceiling: usize) -> Option<usize> {
+    if current >= ceiling {
+        return None;
+    }
+    Some(current.saturating_mul(2).max(current + 1).min(ceiling))
+}
+
+fn require_query_embedding(query_embedding: Option<&[f32]>) -> Result<&[f32]> {
+    query_embedding.ok_or_else(|| {
+        Error::EmbeddingProvider("search mode requires a query embedding".to_string())
+    })
+}
+
+/// Run lexical (BM25) search and return ranked (chunk_id, score) pairs plus timing.
+///
+/// Returns `(candidates, lexical_search_secs)`.
+fn lexical_search(
+    query: &SearchQuery,
+    fts_index: &FtsIndex,
+    limit: usize,
+) -> Result<(Vec<(String, f64)>, f64)> {
+    let t0 = Instant::now();
+    let fts_results = fts_index.search(&query.query, limit)?;
+    let lexical_search_secs = t0.elapsed().as_secs_f64();
+    Ok((
+        fts_results
+            .into_iter()
+            .map(|r| (r.chunk_id, r.score as f64))
+            .collect(),
+        lexical_search_secs,
+    ))
+}
+
+/// Assemble SearchResult objects from ranked candidates, applying decay, filters, min_score,
+/// and multi-hop link-graph boosting.
+#[allow(clippy::too_many_arguments)]
+/// Compute cosine similarity between two vectors. Returns 0.0 if either is zero-length.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f64;
+    let mut norm_a = 0.0_f64;
+    let mut norm_b = 0.0_f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let x = *x as f64;
+        let y = *y as f64;
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom < 1e-12 {
+        0.0
+    } else {
+        (dot / denom).clamp(0.0, 1.0)
+    }
+}
+
+struct AssembleParams<'a> {
+    query: &'a SearchQuery,
+    index: &'a Index,
+    candidates: &'a [(String, f64)],
+    decay_enabled: bool,
+    decay_half_life: f64,
+    decay_exclude: &'a [String],
+    decay_include: &'a [String],
+    boost_links: bool,
+    boost_hops: usize,
+    link_graph: Option<&'a links::LinkGraph>,
+    backlinks: Option<&'a HashMap<String, Vec<links::LinkEntry>>>,
+    now: u64,
+    query_embedding: Option<&'a [f32]>,
+    edge_boost_weight: f64,
+}
+
+fn assemble_results(p: &AssembleParams<'_>) -> Result<Vec<SearchResult>> {
+    let file_mtimes = p.index.get_file_mtimes();
+
+    let mut results = Vec::new();
+    for (chunk_id, score) in p.candidates {
+        // Look up chunk metadata.
+        let Some(chunk) = p.index.get_chunk(chunk_id) else {
+            continue;
+        };
+
+        // Apply path prefix filter (before file metadata lookup for early short-circuit).
+        if let Some(ref prefix) = p.query.path_prefix {
+            if !crate::path_util::path_is_in_scope(&chunk.source_path, prefix) {
+                continue;
+            }
+        }
+
+        // Look up file metadata.
+        let Some(file) = p.index.get_file_metadata(&chunk.source_path) else {
+            continue;
+        };
+
+        // Apply time decay if enabled and path is not excluded.
+        let effective_score = if p.decay_enabled
+            && should_apply_decay(&chunk.source_path, p.decay_exclude, p.decay_include)
+        {
+            let modified = file_mtimes
+                .get(&chunk.source_path)
+                .copied()
+                .unwrap_or(file.indexed_at);
+            apply_time_decay(*score, modified, p.decay_half_life, p.now)
+        } else {
+            *score
+        };
+
+        // Apply min_score threshold (on potentially decayed score).
+        if effective_score < p.query.min_score {
+            continue;
+        }
+
+        // Keep the wire payload raw while filtering against effective metadata.
+        let frontmatter: Option<Value> = file
+            .frontmatter
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let effective_frontmatter = file.effective_frontmatter();
+
+        // Apply metadata filters.
+        if !evaluate_filters(&p.query.filters, effective_frontmatter.as_ref()) {
+            continue;
+        }
+
+        let modified_at = file_mtimes.get(&chunk.source_path).copied();
+
+        results.push(SearchResult {
+            score: effective_score,
+            chunk: SearchResultChunk {
+                chunk_id: chunk_id.clone(),
+                heading_hierarchy: chunk.heading_hierarchy.clone(),
+                content: chunk.content.clone(),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+            },
+            file: SearchResultFile {
+                path: chunk.source_path.clone(),
+                frontmatter,
+                computed_fields: file.computed_values_json(),
+                computed_field_errors: file.computed_errors_json(),
+                file_size: file.file_size,
+                path_components: chunk.source_path.split('/').map(String::from).collect(),
+                modified_at,
+                relations: None,
+            },
+        });
+
+        // Stop early if no decay (order preserved) and we have enough results.
+        if !p.decay_enabled && results.len() >= p.query.limit {
+            break;
+        }
+    }
+
+    // When decay is applied, scores may reorder — re-sort and truncate.
+    if p.decay_enabled && results.len() > 1 {
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(p.query.limit);
+    }
+
+    // Apply multi-hop link-graph boosting if requested.
+    if p.boost_links && results.len() > 1 {
+        if let (Some(graph), Some(bl)) = (p.link_graph, p.backlinks) {
+            // Collect top 3 result paths as BFS seeds.
+            let top_paths: Vec<String> = results
+                .iter()
+                .take(3)
+                .map(|r| r.file.path.clone())
+                .collect();
+
+            // BFS to find neighbors at configurable depth (1–3 hops).
+            let neighbors = links::bfs_neighbors(graph, bl, &top_paths, p.boost_hops);
+
+            if !neighbors.is_empty() {
+                // Pre-fetch edge vectors for semantic edge boosting.
+                let edge_vectors = if p.query_embedding.is_some() && p.edge_boost_weight > 0.0 {
+                    Some(p.index.get_edge_vectors())
+                } else {
+                    None
+                };
+
+                // Build a lookup: target_path → best edge cosine similarity with query.
+                // We look at all semantic edges and index the best score per target file.
+                let edge_scores: HashMap<String, f64> =
+                    if let (Some(qe), Some(evecs), Some(edges_map)) = (
+                        p.query_embedding,
+                        &edge_vectors,
+                        graph.semantic_edges.as_ref(),
+                    ) {
+                        let mut best: HashMap<String, f64> = HashMap::new();
+                        for (eid, edge) in edges_map.iter() {
+                            if let Some(evec) = evecs.get(eid) {
+                                let sim = cosine_similarity(qe, evec);
+                                // Index by both source and target so any file connected
+                                // via a relevant edge gets the boost.
+                                for path in [&edge.source, &edge.target] {
+                                    let entry = best.entry(path.to_string()).or_insert(0.0);
+                                    if sim > *entry {
+                                        *entry = sim;
+                                    }
+                                }
+                            }
+                        }
+                        best
+                    } else {
+                        HashMap::new()
+                    };
+
+                for result in &mut results {
+                    if let Some(&distance) = neighbors.get(&result.file.path) {
+                        // Use edge-weighted boost when edge scores available,
+                        // otherwise fall back to flat boost.
+                        let boost = if let Some(&edge_sim) = edge_scores.get(&result.file.path) {
+                            p.edge_boost_weight * edge_sim
+                        } else {
+                            // Flat fallback: use edge_boost_weight as the base boost.
+                            p.edge_boost_weight
+                        };
+                        let multiplier = 1.0 + boost / 2.0_f64.powi(distance as i32 - 1);
+                        result.score *= multiplier;
+                        debug!(
+                            path = %result.file.path,
+                            distance = distance,
+                            multiplier = multiplier,
+                            "boosted link neighbor score (multi-hop)"
+                        );
+                    }
+                }
+                // Re-sort by score descending.
+                results.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Assemble EdgeSearchResult entries from edge search candidates and the link graph.
+///
+/// For each edge candidate (edge_id, score), looks up the SemanticEdge metadata from
+/// the link graph's semantic_edges map. Falls back to parsing the edge ID for source/target
+/// if the edge is not found in the graph.
+fn assemble_edge_results(
+    candidates: &[(String, f64)],
+    link_graph: Option<&links::LinkGraph>,
+    path_prefix: Option<&str>,
+) -> Vec<EdgeSearchResult> {
+    let semantic_edges = link_graph.and_then(|lg| lg.semantic_edges.as_ref());
+
+    candidates
+        .iter()
+        .filter_map(|(edge_id, score)| {
+            let result = if let Some(edges) = semantic_edges {
+                if let Some(edge) = edges.get(edge_id) {
+                    EdgeSearchResult {
+                        score: *score,
+                        edge_id: edge_id.clone(),
+                        source_path: edge.source.clone(),
+                        target_path: edge.target.clone(),
+                        link_text: String::new(),
+                        context: edge.context_text.clone(),
+                        relationship_type: edge.relationship_type.clone(),
+                        cluster_id: edge.cluster_id,
+                        strength: edge.strength,
+                    }
+                } else {
+                    parse_edge_search_result(edge_id, *score)?
+                }
+            } else {
+                parse_edge_search_result(edge_id, *score)?
+            };
+
+            if path_prefix.is_some_and(|scope| {
+                !crate::path_util::path_is_in_scope(&result.source_path, scope)
+            }) {
+                return None;
+            }
+            Some(result)
+        })
+        .collect()
+}
+
+fn parse_edge_search_result(edge_id: &str, score: f64) -> Option<EdgeSearchResult> {
+    // Fallback format: "edge:source->target@line".
+    let stripped = edge_id.strip_prefix("edge:")?;
+    let (source, rest) = stripped.split_once("->")?;
+    let target = rest.split('@').next()?;
+    Some(EdgeSearchResult {
+        score,
+        edge_id: edge_id.to_string(),
+        source_path: source.to_string(),
+        target_path: target.to_string(),
+        link_text: String::new(),
+        context: String::new(),
+        relationship_type: None,
+        cluster_id: None,
+        strength: None,
+    })
+}
+
+/// Expand graph context by finding relevant chunks from files linked to top search results.
+///
+/// For each file discovered via BFS around top result files (that isn't already in results),
+/// finds the best-matching chunk using HNSW similarity to the query embedding. Returns
+/// `GraphContextItem` entries grouped by hop distance, limited to `expand_limit` per hop.
+fn expand_graph_context(
+    index: &Index,
+    results: &[SearchResult],
+    query_embedding: &[f32],
+    link_graph: &links::LinkGraph,
+    backlinks: &HashMap<String, Vec<links::LinkEntry>>,
+    expand_depth: usize,
+    expand_limit: usize,
+) -> Vec<GraphContextItem> {
+    if results.is_empty() {
+        return Vec::new();
+    }
+
+    // Collect result file paths to exclude from expansion.
+    let result_paths: HashSet<String> = results.iter().map(|r| r.file.path.clone()).collect();
+
+    // Use top result paths as seeds for BFS.
+    let seeds: Vec<String> = results
+        .iter()
+        .take(3)
+        .map(|r| r.file.path.clone())
+        .collect();
+
+    // BFS to find neighbor files at the expansion depth.
+    let neighbors = links::bfs_neighbors(link_graph, backlinks, &seeds, expand_depth);
+
+    // Filter out files already in results.
+    let expansion_targets: Vec<(String, usize)> = neighbors
+        .into_iter()
+        .filter(|(path, _)| !result_paths.contains(path))
+        .collect();
+
+    if expansion_targets.is_empty() {
+        return Vec::new();
+    }
+
+    // Build a set of target file paths for filtering HNSW results.
+    let target_set: HashSet<&str> = expansion_targets.iter().map(|(p, _)| p.as_str()).collect();
+
+    // Search HNSW for similar chunks, then filter to expansion targets.
+    let search_limit = (expansion_targets.len() * 10).max(100);
+    let hnsw_results = match index.search_vectors(query_embedding, search_limit) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    // Find best chunk per target file (highest HNSW score).
+    let mut best_chunks: HashMap<String, (String, f64)> = HashMap::new();
+    for (chunk_id, score) in &hnsw_results {
+        let Some(chunk) = index.get_chunk(chunk_id) else {
+            continue;
+        };
+        if !target_set.contains(chunk.source_path.as_str()) {
+            continue;
+        }
+        let entry = best_chunks
+            .entry(chunk.source_path.clone())
+            .or_insert_with(|| (String::new(), f64::NEG_INFINITY));
+        if *score > entry.1 {
+            *entry = (chunk_id.clone(), *score);
+        }
+    }
+
+    // Also check target files' chunk_ids directly for any that weren't in HNSW results.
+    // This ensures we don't miss files whose chunks didn't appear in the limited HNSW search.
+    for (path, _) in &expansion_targets {
+        if best_chunks.contains_key(path) {
+            continue; // Already found via HNSW
+        }
+        // Try to find any chunk for this file as a fallback (score 0.0).
+        if let Some(file) = index.get_file_metadata(path) {
+            if let Some(first_chunk_id) = file.chunk_ids.first() {
+                if index.get_chunk(first_chunk_id).is_some() {
+                    best_chunks.insert(path.clone(), (first_chunk_id.clone(), 0.0));
+                }
+            }
+        }
+    }
+
+    // Group targets by hop distance and apply per-hop limit.
+    let mut by_hop: HashMap<usize, Vec<(String, f64)>> = HashMap::new();
+    for (path, distance) in &expansion_targets {
+        if let Some((_, score)) = best_chunks.get(path) {
+            by_hop
+                .entry(*distance)
+                .or_default()
+                .push((path.clone(), *score));
+        }
+    }
+
+    let file_mtimes = index.get_file_mtimes();
+    let mut items: Vec<GraphContextItem> = Vec::new();
+
+    for (hop, mut files) in by_hop {
+        // Sort by score descending within each hop.
+        files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        files.truncate(expand_limit);
+
+        for (path, _) in files {
+            let Some((chunk_id, _)) = best_chunks.get(&path) else {
+                continue;
+            };
+            let Some(chunk) = index.get_chunk(chunk_id) else {
+                continue;
+            };
+            let Some(file) = index.get_file_metadata(&path) else {
+                continue;
+            };
+
+            let modified_at = file_mtimes.get(&path).copied();
+            let frontmatter: Option<Value> = file
+                .frontmatter
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok());
+
+            // Find which seed file this neighbor is linked from.
+            let linked_from = find_linked_from(&seeds, &path, link_graph, backlinks);
+
+            // Look up semantic edge context between the linked_from file and this neighbor.
+            let (edge_context, edge_relationship) =
+                find_edge_context(link_graph, &linked_from, &path);
+
+            items.push(GraphContextItem {
+                chunk: SearchResultChunk {
+                    chunk_id: chunk_id.clone(),
+                    heading_hierarchy: chunk.heading_hierarchy.clone(),
+                    content: chunk.content.clone(),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                },
+                file: SearchResultFile {
+                    path: path.clone(),
+                    frontmatter,
+                    computed_fields: file.computed_values_json(),
+                    computed_field_errors: file.computed_errors_json(),
+                    file_size: file.file_size,
+                    path_components: path.split('/').map(String::from).collect(),
+                    modified_at,
+                    relations: None,
+                },
+                linked_from,
+                hop_distance: hop,
+                edge_context,
+                edge_relationship,
+            });
+        }
+    }
+
+    // Sort by hop_distance ascending, then by path for determinism.
+    items.sort_by(|a, b| {
+        a.hop_distance
+            .cmp(&b.hop_distance)
+            .then_with(|| a.file.path.cmp(&b.file.path))
+    });
+
+    items
+}
+
+/// Find semantic edge context between a source and target file.
+///
+/// Searches the link graph's semantic_edges for any edge from source to target,
+/// returning the context text and relationship type if found.
+fn find_edge_context(
+    link_graph: &links::LinkGraph,
+    source: &str,
+    target: &str,
+) -> (Option<String>, Option<String>) {
+    if let Some(edges) = &link_graph.semantic_edges {
+        for edge in edges.values() {
+            if edge.source == source && edge.target == target {
+                let ctx = if edge.context_text.is_empty() {
+                    None
+                } else {
+                    Some(edge.context_text.clone())
+                };
+                return (ctx, edge.relationship_type.clone());
+            }
+        }
+    }
+    (None, None)
+}
+
+/// Find which seed file has a link connection to the target file.
+///
+/// Checks for direct forward or backward links between each seed and the target.
+/// Falls back to the first seed if no direct connection exists (multi-hop case).
+fn find_linked_from(
+    seeds: &[String],
+    target: &str,
+    graph: &links::LinkGraph,
+    backlinks: &HashMap<String, Vec<links::LinkEntry>>,
+) -> String {
+    for seed in seeds {
+        // Check if seed has a forward link to target.
+        if let Some(entries) = graph.forward.get(seed) {
+            if entries.iter().any(|e| e.target == target) {
+                return seed.clone();
+            }
+        }
+        // Check if target links to seed (seed has a backlink from target).
+        if let Some(entries) = backlinks.get(seed) {
+            if entries.iter().any(|e| e.source == target) {
+                return seed.clone();
+            }
+        }
+    }
+    // Fallback: first seed.
+    seeds.first().cloned().unwrap_or_default()
+}
+
+/// Reciprocal Rank Fusion: merges two ranked lists into a single scored list.
+///
+/// Each item's fused score is `Σ 1/(k + rank)` where rank is 1-indexed.
+/// Items appearing in both lists accumulate scores from each.
+/// Returns a list of `(chunk_id, fused_score)` sorted by score descending.
+pub fn reciprocal_rank_fusion(
+    list_a: &[(String, f64)],
+    list_b: &[(String, f64)],
+    k: f64,
+) -> Vec<(String, f64)> {
+    use std::collections::HashMap;
+
+    let mut scores: HashMap<String, f64> = HashMap::new();
+
+    for (rank, (id, _score)) in list_a.iter().enumerate() {
+        let rrf_score = 1.0 / (k + (rank as f64 + 1.0));
+        *scores.entry(id.clone()).or_default() += rrf_score;
+    }
+
+    for (rank, (id, _score)) in list_b.iter().enumerate() {
+        let rrf_score = 1.0 / (k + (rank as f64 + 1.0));
+        *scores.entry(id.clone()).or_default() += rrf_score;
+    }
+
+    let mut results: Vec<(String, f64)> = scores.into_iter().collect();
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results
+}
+
+/// Normalize BM25 scores to `[0, 1]` using saturation: `score / (score + k)`.
+///
+/// This maps the unbounded BM25 range `(0, ∞)` into `(0, 1)` with diminishing returns.
+/// The parameter `k` controls the midpoint (a BM25 score equal to `k` maps to 0.5).
+/// Monotonically increasing, so ranking order is preserved.
+fn normalize_bm25_scores(results: &mut [(String, f64)], k: f64) {
+    for r in results.iter_mut() {
+        r.1 = r.1 / (r.1 + k);
+    }
+}
+
+/// Normalize RRF scores by dividing by the theoretical maximum.
+///
+/// The maximum possible RRF score is `num_lists / (k + 1)`, achieved when a document
+/// is ranked #1 in every list. After normalization:
+/// - 1.0 = top-ranked by all retrievers
+/// - ~0.5 = found by only one retriever at rank 1
+///
+/// Monotonically increasing, so ranking order is preserved.
+fn normalize_rrf_scores(results: &mut [(String, f64)], rrf_k: f64, num_lists: usize) {
+    let max_score = num_lists as f64 / (rrf_k + 1.0);
+    if max_score > 0.0 {
+        for r in results.iter_mut() {
+            r.1 /= max_score;
+        }
+    }
+}
+
+/// Evaluate all metadata filters against parsed frontmatter. Returns `true` if all pass.
+///
+/// - Empty filters → always `true`
+/// - `None` frontmatter with any filter → `false`
+pub(crate) fn evaluate_filters(filters: &[MetadataFilter], frontmatter: Option<&Value>) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let Some(fm) = frontmatter else {
+        return false;
+    };
+
+    filters
+        .iter()
+        .all(|filter| evaluate_single_filter(filter, fm))
+}
+
+/// Equality between a frontmatter value and a filter value, aware of relation
+/// syntax. Exact `==` runs first (zero regression for existing filters); when
+/// the frontmatter value is link-shaped, both sides are normalized via
+/// [`crate::relations::relation_key`] so `--filter client=clients/acme`,
+/// `client=clients/acme.md`, and `client=[[clients/acme]]` all match
+/// `"[[clients/acme|Acme]]"`. Purely syntactic — no path resolution happens.
+fn filter_values_equal(field_value: &Value, filter_value: &Value) -> bool {
+    if field_value == filter_value {
+        return true;
+    }
+    if let (Value::String(fv), Value::String(qv)) = (field_value, filter_value) {
+        if let Some(key) = crate::relations::relation_key(fv) {
+            let coerced = crate::relations::relation_key(qv)
+                .unwrap_or_else(|| qv.strip_suffix(".md").unwrap_or(qv).to_string());
+            return key == coerced;
+        }
+    }
+    false
+}
+
+/// Evaluate a single metadata filter against frontmatter.
+fn evaluate_single_filter(filter: &MetadataFilter, frontmatter: &Value) -> bool {
+    match filter {
+        MetadataFilter::Equals { field, value } => {
+            let Some(field_value) = frontmatter.get(field) else {
+                return false;
+            };
+            // If field is an array, check if it contains the value
+            if let Some(arr) = field_value.as_array() {
+                arr.iter().any(|v| filter_values_equal(v, value))
+            } else {
+                filter_values_equal(field_value, value)
+            }
+        }
+        MetadataFilter::In { field, values } => {
+            if values.is_empty() {
+                return false;
+            }
+            let Some(field_value) = frontmatter.get(field) else {
+                return false;
+            };
+            // If field is an array, check intersection
+            if let Some(arr) = field_value.as_array() {
+                arr.iter()
+                    .any(|v| values.iter().any(|q| filter_values_equal(v, q)))
+            } else {
+                values.iter().any(|q| filter_values_equal(field_value, q))
+            }
+        }
+        MetadataFilter::Range { field, min, max } => {
+            let Some(field_value) = frontmatter.get(field) else {
+                return false;
+            };
+            if let Some(min_val) = min {
+                if !compare_values(field_value, min_val, std::cmp::Ordering::Greater) {
+                    return false;
+                }
+            }
+            if let Some(max_val) = max {
+                if !compare_values(field_value, max_val, std::cmp::Ordering::Less) {
+                    return false;
+                }
+            }
+            true
+        }
+        MetadataFilter::Exists { field } => frontmatter.get(field).is_some_and(|v| !v.is_null()),
+    }
+}
+
+/// Compare two JSON values. Returns true if `a` is equal to `b` or has the given ordering
+/// relative to `b`. Numeric values are compared as decimals; otherwise falls back to string comparison.
+fn compare_values(a: &Value, b: &Value, ordering: std::cmp::Ordering) -> bool {
+    // Try exact decimal comparison first. JSON numbers are parsed from their
+    // textual representation so metadata ordering never detours through f64.
+    if let (Some(a_num), Some(b_num)) = (as_decimal(a), as_decimal(b)) {
+        let cmp = a_num.cmp(&b_num);
+        return cmp == std::cmp::Ordering::Equal || cmp == ordering;
+    }
+    // Fall back to string comparison
+    let a_str = value_as_string(a);
+    let b_str = value_as_string(b);
+    let cmp = a_str.cmp(&b_str);
+    cmp == std::cmp::Ordering::Equal || cmp == ordering
+}
+
+/// Total ordering of two JSON values for stable sorting.
+///
+/// Uses the same numeric-then-lexicographic rule as the filter path
+/// ([`compare_values`] / [`Range`](MetadataFilter::Range)), but returns a real
+/// [`std::cmp::Ordering`] (the less/equal/greater trichotomy a sort needs)
+/// instead of a bool. This guarantees that sort order and `Range`-filter order
+/// never disagree.
+///
+/// - Both parse as numbers → compared as exact decimals.
+/// - Both booleans → `false < true`.
+/// - Otherwise → compared by their stringified form
+///   ([`value_as_string`], which preserves raw strings and JSON-encodes
+///   lists/objects).
+///
+/// Null handling (nulls-last) is the caller's responsibility — this function
+/// only orders two concrete, non-null values.
+pub(crate) fn compare_json_for_sort(a: &Value, b: &Value) -> std::cmp::Ordering {
+    // Numeric comparison first (mirrors compare_values).
+    if let (Some(a_num), Some(b_num)) = (as_decimal(a), as_decimal(b)) {
+        return a_num.cmp(&b_num);
+    }
+    // Booleans: false < true. (Equivalent to the string fallback below, which
+    // yields "false" < "true", so this stays consistent with compare_values.)
+    if let (Value::Bool(a_b), Value::Bool(b_b)) = (a, b) {
+        return a_b.cmp(b_b);
+    }
+    // Fall back to string comparison (strings, dates, lists, objects, mixed).
+    value_as_string(a).cmp(&value_as_string(b))
+}
+
+/// Parse a JSON number without routing it through IEEE-754.
+fn as_decimal(v: &Value) -> Option<rust_decimal::Decimal> {
+    use std::str::FromStr;
+
+    match v {
+        Value::Number(number) => rust_decimal::Decimal::from_str(&number.to_string()).ok(),
+        _ => None,
+    }
+}
+
+/// Convert a JSON value to a string for lexicographic comparison.
+fn value_as_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        _ => v.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- SearchMode tests ---
+
+    #[test]
+    fn test_search_mode_default_is_hybrid() {
+        assert_eq!(SearchMode::default(), SearchMode::Hybrid);
+    }
+
+    #[test]
+    fn test_search_mode_from_str() {
+        assert_eq!("hybrid".parse::<SearchMode>().unwrap(), SearchMode::Hybrid);
+        assert_eq!(
+            "semantic".parse::<SearchMode>().unwrap(),
+            SearchMode::Semantic
+        );
+        assert_eq!(
+            "lexical".parse::<SearchMode>().unwrap(),
+            SearchMode::Lexical
+        );
+        // Case-insensitive
+        assert_eq!("HYBRID".parse::<SearchMode>().unwrap(), SearchMode::Hybrid);
+        assert_eq!(
+            "Semantic".parse::<SearchMode>().unwrap(),
+            SearchMode::Semantic
+        );
+    }
+
+    #[test]
+    fn test_search_mode_edge_from_str() {
+        assert_eq!("edge".parse::<SearchMode>().unwrap(), SearchMode::Edge);
+        assert_eq!("EDGE".parse::<SearchMode>().unwrap(), SearchMode::Edge);
+        assert_eq!("Edge".parse::<SearchMode>().unwrap(), SearchMode::Edge);
+    }
+
+    #[test]
+    fn test_search_mode_edge_display() {
+        assert_eq!(SearchMode::Edge.to_string(), "edge");
+    }
+
+    #[test]
+    fn test_search_mode_edge_serialize() {
+        assert_eq!(
+            serde_json::to_string(&SearchMode::Edge).unwrap(),
+            "\"edge\""
+        );
+    }
+
+    #[test]
+    fn test_edge_search_result_serialize() {
+        let result = EdgeSearchResult {
+            score: 0.85,
+            edge_id: "a.md->b.md".into(),
+            source_path: "a.md".into(),
+            target_path: "b.md".into(),
+            link_text: "see also".into(),
+            context: "For more details, see also b.md".into(),
+            relationship_type: Some("references".into()),
+            cluster_id: Some(2),
+            strength: Some(0.9),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["score"], 0.85);
+        assert_eq!(json["edge_id"], "a.md->b.md");
+        assert_eq!(json["relationship_type"], "references");
+        assert_eq!(json["cluster_id"], 2);
+        assert_eq!(json["strength"], 0.9);
+    }
+
+    #[test]
+    fn test_edge_search_result_optional_fields_skipped() {
+        let result = EdgeSearchResult {
+            score: 0.5,
+            edge_id: "x->y".into(),
+            source_path: "x.md".into(),
+            target_path: "y.md".into(),
+            link_text: "link".into(),
+            context: "ctx".into(),
+            relationship_type: None,
+            cluster_id: None,
+            strength: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("relationship_type"));
+        assert!(!json.contains("cluster_id"));
+        assert!(!json.contains("strength"));
+    }
+
+    #[test]
+    fn test_search_response_edge_results_skipped_when_empty() {
+        let resp = SearchResponse {
+            results: Vec::new(),
+            graph_context: Vec::new(),
+            edge_results: Vec::new(),
+            timings: SearchTimings {
+                embed_secs: 0.0,
+                vector_search_secs: 0.0,
+                lexical_search_secs: 0.0,
+                fusion_secs: 0.0,
+                assemble_secs: 0.0,
+                total_secs: 0.0,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("edge_results"));
+    }
+
+    #[test]
+    fn test_graph_context_item_edge_fields() {
+        let item = GraphContextItem {
+            chunk: SearchResultChunk {
+                chunk_id: "a.md#0".into(),
+                heading_hierarchy: vec![],
+                content: "test".into(),
+                start_line: 1,
+                end_line: 5,
+            },
+            file: SearchResultFile {
+                path: "a.md".into(),
+                frontmatter: None,
+                computed_fields: serde_json::Map::new(),
+                computed_field_errors: std::collections::BTreeMap::new(),
+                file_size: 100,
+                path_components: vec!["a.md".into()],
+                modified_at: None,
+                relations: None,
+            },
+            linked_from: "b.md".into(),
+            hop_distance: 1,
+            edge_context: Some("related to".into()),
+            edge_relationship: Some("extends".into()),
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["edge_context"], "related to");
+        assert_eq!(json["edge_relationship"], "extends");
+    }
+
+    #[test]
+    fn test_graph_context_item_edge_fields_skipped_when_none() {
+        let item = GraphContextItem {
+            chunk: SearchResultChunk {
+                chunk_id: "a.md#0".into(),
+                heading_hierarchy: vec![],
+                content: "test".into(),
+                start_line: 1,
+                end_line: 5,
+            },
+            file: SearchResultFile {
+                path: "a.md".into(),
+                frontmatter: None,
+                computed_fields: serde_json::Map::new(),
+                computed_field_errors: std::collections::BTreeMap::new(),
+                file_size: 100,
+                path_components: vec!["a.md".into()],
+                modified_at: None,
+                relations: None,
+            },
+            linked_from: "b.md".into(),
+            hop_distance: 1,
+            edge_context: None,
+            edge_relationship: None,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("edge_context"));
+        assert!(!json.contains("edge_relationship"));
+    }
+
+    #[test]
+    fn test_search_mode_from_str_invalid() {
+        let err = "invalid".parse::<SearchMode>().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown search mode"));
+    }
+
+    #[test]
+    fn test_search_mode_display() {
+        assert_eq!(SearchMode::Hybrid.to_string(), "hybrid");
+        assert_eq!(SearchMode::Semantic.to_string(), "semantic");
+        assert_eq!(SearchMode::Lexical.to_string(), "lexical");
+    }
+
+    #[test]
+    fn test_search_mode_serialize() {
+        assert_eq!(
+            serde_json::to_string(&SearchMode::Hybrid).unwrap(),
+            "\"hybrid\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SearchMode::Lexical).unwrap(),
+            "\"lexical\""
+        );
+    }
+
+    // --- SortOrder tests ---
+
+    #[test]
+    fn test_sort_order_default_is_asc() {
+        assert_eq!(SortOrder::default(), SortOrder::Asc);
+    }
+
+    #[test]
+    fn test_sort_order_from_str() {
+        assert_eq!("asc".parse::<SortOrder>().unwrap(), SortOrder::Asc);
+        assert_eq!("desc".parse::<SortOrder>().unwrap(), SortOrder::Desc);
+        // Case-insensitive + long forms.
+        assert_eq!("ASC".parse::<SortOrder>().unwrap(), SortOrder::Asc);
+        assert_eq!("Descending".parse::<SortOrder>().unwrap(), SortOrder::Desc);
+        assert!("sideways".parse::<SortOrder>().is_err());
+    }
+
+    #[test]
+    fn test_sort_order_serialize_lowercase() {
+        assert_eq!(serde_json::to_string(&SortOrder::Asc).unwrap(), "\"asc\"");
+        assert_eq!(serde_json::to_string(&SortOrder::Desc).unwrap(), "\"desc\"");
+    }
+
+    // --- compare_json_for_sort tests ---
+
+    #[test]
+    fn test_compare_json_for_sort_numeric() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_json_for_sort(&json!(1), &json!(2)), Ordering::Less);
+        assert_eq!(
+            compare_json_for_sort(&json!(2.5), &json!(2.5)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_json_for_sort(&json!(10), &json!(2)),
+            Ordering::Greater
+        );
+        // Numeric (not lexicographic): 10 > 2 even though "10" < "2" as strings.
+        assert_eq!(
+            compare_json_for_sort(&json!(10), &json!(9)),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_compare_json_for_sort_avoids_f64_precision_loss() {
+        use std::cmp::Ordering;
+        let lower: Value = serde_json::from_str("9007199254740992").unwrap();
+        let higher: Value = serde_json::from_str("9007199254740993").unwrap();
+        assert_eq!(compare_json_for_sort(&lower, &higher), Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_json_for_sort_string() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            compare_json_for_sort(&json!("apple"), &json!("banana")),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_json_for_sort(&json!("zed"), &json!("zed")),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_json_for_sort(&json!("draft"), &json!("published")),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_compare_json_for_sort_bool() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            compare_json_for_sort(&json!(false), &json!(true)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_json_for_sort(&json!(true), &json!(false)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_json_for_sort(&json!(true), &json!(true)),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_compare_json_for_sort_list_falls_back_to_string() {
+        use std::cmp::Ordering;
+        // Lists are compared by their JSON-string form, deterministically.
+        let ord = compare_json_for_sort(&json!(["a"]), &json!(["b"]));
+        assert_eq!(ord, Ordering::Less);
+        assert_eq!(
+            compare_json_for_sort(&json!(["x"]), &json!(["x"])),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_compare_json_for_sort_consistent_with_compare_values() {
+        // For any pair, compare_json_for_sort must agree with compare_values'
+        // notion of ordering so sort and Range-filter ordering never disagree.
+        let pairs = [
+            (json!(1), json!(2)),
+            (json!(5), json!(5)),
+            (json!(10), json!(2)),
+            (json!("apple"), json!("banana")),
+            (json!("zed"), json!("zed")),
+            (json!(false), json!(true)),
+            (json!(true), json!(true)),
+            (json!("2024-01-01"), json!("2024-12-31")),
+        ];
+        for (a, b) in &pairs {
+            let ord = compare_json_for_sort(a, b);
+            // a <= b  ⟺  compare_values(a, b, Less)
+            assert_eq!(
+                ord != std::cmp::Ordering::Greater,
+                compare_values(a, b, std::cmp::Ordering::Less),
+                "Less mismatch for {a:?} vs {b:?}"
+            );
+            // a >= b  ⟺  compare_values(a, b, Greater)
+            assert_eq!(
+                ord != std::cmp::Ordering::Less,
+                compare_values(a, b, std::cmp::Ordering::Greater),
+                "Greater mismatch for {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    // --- SearchQuery builder tests ---
+
+    #[test]
+    fn test_search_query_defaults() {
+        let q = SearchQuery::new("hello world");
+        assert_eq!(q.query, "hello world");
+        assert_eq!(q.limit, 10);
+        assert_eq!(q.min_score, 0.0);
+        assert!(q.filters.is_empty());
+        assert_eq!(q.mode, SearchMode::Hybrid);
+    }
+
+    #[test]
+    fn test_path_prefix_defaults_to_none() {
+        let q = SearchQuery::new("hello");
+        assert!(q.path_prefix.is_none());
+    }
+
+    #[test]
+    fn test_search_query_with_path_prefix() {
+        let q = SearchQuery::new("hello").with_path_prefix("docs/");
+        assert_eq!(q.path_prefix, Some("docs/".to_string()));
+    }
+
+    #[test]
+    fn test_search_query_builder_chain() {
+        let q = SearchQuery::new("test query")
+            .with_limit(5)
+            .with_min_score(0.7)
+            .with_filter(MetadataFilter::Exists {
+                field: "author".into(),
+            });
+        assert_eq!(q.limit, 5);
+        assert_eq!(q.min_score, 0.7);
+        assert_eq!(q.filters.len(), 1);
+    }
+
+    #[test]
+    fn test_search_query_with_mode() {
+        let q = SearchQuery::new("test").with_mode(SearchMode::Lexical);
+        assert_eq!(q.mode, SearchMode::Lexical);
+
+        let q2 = SearchQuery::new("test").with_mode(SearchMode::Semantic);
+        assert_eq!(q2.mode, SearchMode::Semantic);
+    }
+
+    // --- Filter evaluation tests ---
+
+    #[test]
+    fn test_no_filters_always_passes() {
+        assert!(evaluate_filters(&[], Some(&json!({"a": 1}))));
+        assert!(evaluate_filters(&[], None));
+    }
+
+    #[test]
+    fn test_filters_no_frontmatter() {
+        let filters = vec![MetadataFilter::Exists { field: "a".into() }];
+        assert!(!evaluate_filters(&filters, None));
+    }
+
+    #[test]
+    fn test_equals_filter_matches() {
+        let fm = json!({"status": "draft"});
+        let filters = vec![MetadataFilter::Equals {
+            field: "status".into(),
+            value: json!("draft"),
+        }];
+        assert!(evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_equals_filter_rejects_mismatch() {
+        let fm = json!({"status": "published"});
+        let filters = vec![MetadataFilter::Equals {
+            field: "status".into(),
+            value: json!("draft"),
+        }];
+        assert!(!evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_equals_filter_array_contains() {
+        let fm = json!({"tags": ["rust", "cli"]});
+        let filters = vec![MetadataFilter::Equals {
+            field: "tags".into(),
+            value: json!("rust"),
+        }];
+        assert!(evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_in_filter_matches_value_in_list() {
+        let fm = json!({"status": "draft"});
+        let filters = vec![MetadataFilter::In {
+            field: "status".into(),
+            values: vec![json!("draft"), json!("review")],
+        }];
+        assert!(evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_in_filter_array_intersection() {
+        let fm = json!({"tags": ["rust", "cli"]});
+        let filters = vec![MetadataFilter::In {
+            field: "tags".into(),
+            values: vec![json!("python"), json!("cli")],
+        }];
+        assert!(evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_in_filter_empty_values() {
+        let fm = json!({"status": "draft"});
+        let filters = vec![MetadataFilter::In {
+            field: "status".into(),
+            values: vec![],
+        }];
+        assert!(!evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_range_filter_numeric_within() {
+        let fm = json!({"year": 2024});
+        let filters = vec![MetadataFilter::Range {
+            field: "year".into(),
+            min: Some(json!(2023)),
+            max: Some(json!(2025)),
+        }];
+        assert!(evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_range_filter_min_only() {
+        let fm = json!({"year": 2024});
+        let filters = vec![MetadataFilter::Range {
+            field: "year".into(),
+            min: Some(json!(2020)),
+            max: None,
+        }];
+        assert!(evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_range_filter_max_only() {
+        let fm = json!({"year": 2024});
+        let filters = vec![MetadataFilter::Range {
+            field: "year".into(),
+            min: None,
+            max: Some(json!(2025)),
+        }];
+        assert!(evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_range_filter_numeric_out_of_range() {
+        let fm = json!({"year": 2026});
+        let filters = vec![MetadataFilter::Range {
+            field: "year".into(),
+            min: Some(json!(2023)),
+            max: Some(json!(2025)),
+        }];
+        assert!(!evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_exists_filter_present() {
+        let fm = json!({"author": "Alice"});
+        let filters = vec![MetadataFilter::Exists {
+            field: "author".into(),
+        }];
+        assert!(evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_exists_filter_missing() {
+        let fm = json!({"title": "Foo"});
+        let filters = vec![MetadataFilter::Exists {
+            field: "author".into(),
+        }];
+        assert!(!evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_exists_filter_null_value() {
+        let fm = json!({"author": null});
+        let filters = vec![MetadataFilter::Exists {
+            field: "author".into(),
+        }];
+        assert!(!evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_multiple_filters_and_logic() {
+        let fm = json!({"status": "draft", "year": 2024});
+        let filters = vec![
+            MetadataFilter::Equals {
+                field: "status".into(),
+                value: json!("draft"),
+            },
+            MetadataFilter::Range {
+                field: "year".into(),
+                min: Some(json!(2023)),
+                max: Some(json!(2025)),
+            },
+        ];
+        assert!(evaluate_filters(&filters, Some(&fm)));
+
+        // One filter fails → all fail
+        let filters_fail = vec![
+            MetadataFilter::Equals {
+                field: "status".into(),
+                value: json!("published"),
+            },
+            MetadataFilter::Range {
+                field: "year".into(),
+                min: Some(json!(2023)),
+                max: Some(json!(2025)),
+            },
+        ];
+        assert!(!evaluate_filters(&filters_fail, Some(&fm)));
+    }
+
+    // --- relation-aware filter tests (phase 31) ---
+
+    #[test]
+    fn test_equals_relation_filter_variants_match() {
+        let fm = json!({"client": "[[clients/acme|Acme]]"});
+        for filter_value in ["clients/acme", "clients/acme.md", "[[clients/acme]]"] {
+            let filters = vec![MetadataFilter::Equals {
+                field: "client".into(),
+                value: json!(filter_value),
+            }];
+            assert!(
+                evaluate_filters(&filters, Some(&fm)),
+                "filter {filter_value:?} should match a relation value"
+            );
+        }
+    }
+
+    #[test]
+    fn test_equals_relation_filter_rejects_other_target() {
+        let fm = json!({"client": "[[clients/acme|Acme]]"});
+        let filters = vec![MetadataFilter::Equals {
+            field: "client".into(),
+            value: json!("clients/globex"),
+        }];
+        assert!(!evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_equals_relation_filter_array_field() {
+        let fm = json!({"clients": ["[[clients/acme|A]]", "[[clients/globex]]"]});
+        let filters = vec![MetadataFilter::Equals {
+            field: "clients".into(),
+            value: json!("clients/globex"),
+        }];
+        assert!(evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_in_relation_filter() {
+        let fm = json!({"client": "[[clients/acme]]"});
+        let filters = vec![MetadataFilter::In {
+            field: "client".into(),
+            values: vec![json!("clients/globex"), json!("clients/acme.md")],
+        }];
+        assert!(evaluate_filters(&filters, Some(&fm)));
+    }
+
+    #[test]
+    fn test_relation_filter_no_regression_for_plain_values() {
+        // Non-link strings never enter the normalized path.
+        let fm = json!({"status": "draft", "n": 5, "tags": ["a", "b"], "date": "2024-01-15"});
+        assert!(evaluate_filters(
+            &[MetadataFilter::Equals {
+                field: "status".into(),
+                value: json!("draft")
+            }],
+            Some(&fm)
+        ));
+        assert!(!evaluate_filters(
+            &[MetadataFilter::Equals {
+                field: "status".into(),
+                value: json!("draft.md")
+            }],
+            Some(&fm)
+        ));
+        assert!(evaluate_filters(
+            &[MetadataFilter::Equals {
+                field: "n".into(),
+                value: json!(5)
+            }],
+            Some(&fm)
+        ));
+        assert!(evaluate_filters(
+            &[MetadataFilter::Equals {
+                field: "tags".into(),
+                value: json!("a")
+            }],
+            Some(&fm)
+        ));
+        assert!(evaluate_filters(
+            &[MetadataFilter::Equals {
+                field: "date".into(),
+                value: json!("2024-01-15")
+            }],
+            Some(&fm)
+        ));
+    }
+
+    #[test]
+    fn test_relation_filter_is_purely_syntactic() {
+        // Documented limitation: [[acme]] under a target overlay matches
+        // client=acme, NOT client=clients/acme (no resolution at filter time).
+        let fm = json!({"client": "[[acme]]"});
+        assert!(evaluate_filters(
+            &[MetadataFilter::Equals {
+                field: "client".into(),
+                value: json!("acme")
+            }],
+            Some(&fm)
+        ));
+        assert!(!evaluate_filters(
+            &[MetadataFilter::Equals {
+                field: "client".into(),
+                value: json!("clients/acme")
+            }],
+            Some(&fm)
+        ));
+    }
+
+    // --- boost_links field and builder tests ---
+
+    #[test]
+    fn test_search_query_boost_links_default_none() {
+        let q = SearchQuery::new("test");
+        assert!(q.boost_links.is_none());
+    }
+
+    #[test]
+    fn test_search_query_with_boost_links() {
+        let q = SearchQuery::new("test").with_boost_links(true);
+        assert_eq!(q.boost_links, Some(true));
+    }
+
+    #[test]
+    fn test_search_query_with_boost_links_false() {
+        let q = SearchQuery::new("test")
+            .with_boost_links(true)
+            .with_boost_links(false);
+        assert_eq!(q.boost_links, Some(false));
+    }
+
+    #[test]
+    fn test_search_query_builder_chain_with_boost_links() {
+        let q = SearchQuery::new("test")
+            .with_limit(5)
+            .with_min_score(0.5)
+            .with_boost_links(true);
+        assert_eq!(q.limit, 5);
+        assert_eq!(q.min_score, 0.5);
+        assert_eq!(q.boost_links, Some(true));
+    }
+
+    // --- RRF tests ---
+
+    #[test]
+    fn test_rrf_overlapping_lists() {
+        let list_a = vec![
+            ("a".to_string(), 0.9),
+            ("b".to_string(), 0.8),
+            ("c".to_string(), 0.7),
+        ];
+        let list_b = vec![
+            ("b".to_string(), 5.0),
+            ("c".to_string(), 4.0),
+            ("d".to_string(), 3.0),
+        ];
+        let results = reciprocal_rank_fusion(&list_a, &list_b, 60.0);
+
+        // "b" appears in both lists (rank 2 in A, rank 1 in B)
+        let b_score: f64 = results.iter().find(|(id, _)| id == "b").unwrap().1;
+        let expected_b = 1.0 / (60.0 + 2.0) + 1.0 / (60.0 + 1.0);
+        assert!((b_score - expected_b).abs() < 1e-10);
+
+        // "a" only in list_a rank 1
+        let a_score = results.iter().find(|(id, _)| id == "a").unwrap().1;
+        let expected_a = 1.0 / (60.0 + 1.0);
+        assert!((a_score - expected_a).abs() < 1e-10);
+
+        // Results sorted descending by score
+        for w in results.windows(2) {
+            assert!(w[0].1 >= w[1].1);
+        }
+    }
+
+    #[test]
+    fn test_rrf_disjoint_lists() {
+        let list_a = vec![("a".to_string(), 1.0), ("b".to_string(), 0.5)];
+        let list_b = vec![("c".to_string(), 1.0), ("d".to_string(), 0.5)];
+        let results = reciprocal_rank_fusion(&list_a, &list_b, 60.0);
+
+        assert_eq!(results.len(), 4);
+        // All items have single-list scores: 1/(60+rank)
+        let a_score = results.iter().find(|(id, _)| id == "a").unwrap().1;
+        assert!((a_score - 1.0 / 61.0).abs() < 1e-10);
+        let c_score = results.iter().find(|(id, _)| id == "c").unwrap().1;
+        assert!((c_score - 1.0 / 61.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_rrf_single_list_with_empty() {
+        let list_a = vec![("x".to_string(), 1.0), ("y".to_string(), 0.5)];
+        let empty: Vec<(String, f64)> = vec![];
+        let results = reciprocal_rank_fusion(&list_a, &empty, 60.0);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "x");
+        assert!((results[0].1 - 1.0 / 61.0).abs() < 1e-10);
+        assert_eq!(results[1].0, "y");
+        assert!((results[1].1 - 1.0 / 62.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_rrf_k_parameter_effect() {
+        let list_a = vec![("a".to_string(), 1.0), ("b".to_string(), 0.5)];
+        let list_b = vec![("a".to_string(), 1.0), ("b".to_string(), 0.5)];
+
+        // Smaller k → larger scores and bigger spread between ranks
+        let results_k1 = reciprocal_rank_fusion(&list_a, &list_b, 1.0);
+        let results_k60 = reciprocal_rank_fusion(&list_a, &list_b, 60.0);
+
+        let a_k1 = results_k1.iter().find(|(id, _)| id == "a").unwrap().1;
+        let a_k60 = results_k60.iter().find(|(id, _)| id == "a").unwrap().1;
+        // k=1: score = 2 * 1/(1+1) = 1.0; k=60: score = 2 * 1/(60+1) ≈ 0.0328
+        assert!(a_k1 > a_k60);
+    }
+
+    #[test]
+    fn test_rrf_empty_inputs() {
+        let empty: Vec<(String, f64)> = vec![];
+        let results = reciprocal_rank_fusion(&empty, &empty, 60.0);
+        assert!(results.is_empty());
+    }
+
+    // --- BM25 normalization tests ---
+
+    #[test]
+    fn test_bm25_normalization_midpoint() {
+        // A BM25 score equal to k should normalize to 0.5
+        let mut results = vec![("a".to_string(), 1.5)];
+        normalize_bm25_scores(&mut results, 1.5);
+        assert!((results[0].1 - 0.5).abs() < 1e-10, "k maps to 0.5");
+    }
+
+    #[test]
+    fn test_bm25_normalization_known_values() {
+        let mut results = vec![
+            ("a".to_string(), 0.0),
+            ("b".to_string(), 0.5),
+            ("c".to_string(), 1.5),
+            ("d".to_string(), 3.0),
+            ("e".to_string(), 6.0),
+            ("f".to_string(), 15.0),
+        ];
+        normalize_bm25_scores(&mut results, 1.5);
+
+        assert!((results[0].1 - 0.0).abs() < 1e-10, "0 maps to 0");
+        assert!((results[1].1 - 0.25).abs() < 1e-10, "0.5 maps to 0.25");
+        assert!((results[2].1 - 0.5).abs() < 1e-10, "1.5 maps to 0.5");
+        assert!(
+            (results[3].1 - 2.0 / 3.0).abs() < 1e-10,
+            "3.0 maps to ~0.67"
+        );
+        assert!((results[4].1 - 0.8).abs() < 1e-10, "6.0 maps to 0.8");
+        assert!(
+            (results[5].1 - 15.0 / 16.5).abs() < 1e-10,
+            "15.0 maps to ~0.91"
+        );
+    }
+
+    #[test]
+    fn test_bm25_normalization_preserves_order() {
+        let mut results = vec![
+            ("a".to_string(), 10.0),
+            ("b".to_string(), 5.0),
+            ("c".to_string(), 1.0),
+        ];
+        normalize_bm25_scores(&mut results, 1.5);
+        assert!(results[0].1 > results[1].1);
+        assert!(results[1].1 > results[2].1);
+    }
+
+    #[test]
+    fn test_bm25_normalization_stays_below_one() {
+        let mut results = vec![("a".to_string(), 1000.0)];
+        normalize_bm25_scores(&mut results, 1.5);
+        assert!(
+            results[0].1 < 1.0,
+            "score should be < 1.0, got {}",
+            results[0].1
+        );
+    }
+
+    #[test]
+    fn test_bm25_normalization_empty() {
+        let mut results: Vec<(String, f64)> = vec![];
+        normalize_bm25_scores(&mut results, 1.5);
+        assert!(results.is_empty());
+    }
+
+    // --- RRF normalization tests ---
+
+    #[test]
+    fn test_rrf_normalization_rank1_both_lists() {
+        // #1 in both lists with k=60 → raw score = 2/61, max = 2/61 → normalized = 1.0
+        let mut results = vec![("a".to_string(), 2.0 / 61.0)];
+        normalize_rrf_scores(&mut results, 60.0, 2);
+        assert!(
+            (results[0].1 - 1.0).abs() < 1e-10,
+            "expected 1.0, got {}",
+            results[0].1
+        );
+    }
+
+    #[test]
+    fn test_rrf_normalization_rank1_one_list() {
+        // #1 in one list only → raw = 1/61, max = 2/61 → normalized = 0.5
+        let mut results = vec![("a".to_string(), 1.0 / 61.0)];
+        normalize_rrf_scores(&mut results, 60.0, 2);
+        assert!(
+            (results[0].1 - 0.5).abs() < 1e-10,
+            "expected 0.5, got {}",
+            results[0].1
+        );
+    }
+
+    #[test]
+    fn test_rrf_normalization_preserves_order() {
+        let mut results = vec![
+            ("a".to_string(), 2.0 / 61.0),              // both #1
+            ("b".to_string(), 1.0 / 61.0 + 1.0 / 62.0), // #1 + #2
+            ("c".to_string(), 1.0 / 61.0),              // single #1
+        ];
+        normalize_rrf_scores(&mut results, 60.0, 2);
+        assert!(results[0].1 > results[1].1);
+        assert!(results[1].1 > results[2].1);
+    }
+
+    #[test]
+    fn test_rrf_normalization_empty() {
+        let mut results: Vec<(String, f64)> = vec![];
+        normalize_rrf_scores(&mut results, 60.0, 2);
+        assert!(results.is_empty());
+    }
+
+    // --- Time decay tests ---
+
+    #[test]
+    fn test_apply_time_decay_zero_age() {
+        // File modified right now → multiplier should be 1.0 (no penalty).
+        let now = 1_700_000_000;
+        let result = apply_time_decay(0.9, now, 90.0, now);
+        assert!((result - 0.9).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_apply_time_decay_at_half_life() {
+        // File modified exactly 90 days ago with 90-day half-life → score halved.
+        let now = 1_700_000_000;
+        let modified = now - 90 * 86400;
+        let result = apply_time_decay(1.0, modified, 90.0, now);
+        assert!((result - 0.5).abs() < 1e-10, "expected 0.5, got {}", result);
+    }
+
+    #[test]
+    fn test_apply_time_decay_double_half_life() {
+        // File modified 180 days ago → score quartered.
+        let now = 1_700_000_000;
+        let modified = now - 180 * 86400;
+        let result = apply_time_decay(1.0, modified, 90.0, now);
+        assert!(
+            (result - 0.25).abs() < 1e-10,
+            "expected 0.25, got {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_apply_time_decay_very_old() {
+        // File modified 365 days ago → very low score.
+        let now = 1_700_000_000;
+        let modified = now - 365 * 86400;
+        let result = apply_time_decay(1.0, modified, 90.0, now);
+        assert!(result > 0.0, "score should never be zero");
+        assert!(
+            result < 0.1,
+            "365 days old should be < 10% of original, got {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_apply_time_decay_preserves_zero_score() {
+        let now = 1_700_000_000;
+        let modified = now - 30 * 86400;
+        let result = apply_time_decay(0.0, modified, 90.0, now);
+        assert!((result - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_apply_time_decay_short_half_life() {
+        // 7-day half-life: more aggressive decay.
+        let now = 1_700_000_000;
+        let modified = now - 7 * 86400;
+        let result = apply_time_decay(1.0, modified, 7.0, now);
+        assert!((result - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_apply_time_decay_future_modified() {
+        // Edge case: modified_at in the future (clock skew) → saturating_sub gives 0, no penalty.
+        let now = 1_700_000_000;
+        let modified = now + 100;
+        let result = apply_time_decay(0.8, modified, 90.0, now);
+        assert!(
+            (result - 0.8).abs() < 1e-10,
+            "future mtime should have no penalty, got {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_apply_time_decay_never_exceeds_original() {
+        // Decay should never increase the score.
+        let now = 1_700_000_000;
+        for days_ago in [0, 1, 10, 30, 90, 180, 365, 1000] {
+            let modified = now - days_ago * 86400;
+            let result = apply_time_decay(0.75, modified, 90.0, now);
+            assert!(
+                result <= 0.75 + 1e-10,
+                "decay should not exceed original score for age {} days",
+                days_ago
+            );
+            assert!(result >= 0.0, "decay should not go negative");
+        }
+    }
+
+    // --- SearchQuery decay builder tests ---
+
+    #[test]
+    fn test_search_query_decay_defaults() {
+        let q = SearchQuery::new("test");
+        assert!(q.decay.is_none());
+        assert!(q.decay_half_life.is_none());
+        assert!(q.decay_exclude.is_none());
+        assert!(q.decay_include.is_none());
+    }
+
+    #[test]
+    fn test_search_query_with_decay() {
+        let q = SearchQuery::new("test").with_decay(true);
+        assert_eq!(q.decay, Some(true));
+    }
+
+    #[test]
+    fn test_search_query_with_decay_disabled() {
+        let q = SearchQuery::new("test").with_decay(false);
+        assert_eq!(q.decay, Some(false));
+    }
+
+    #[test]
+    fn test_search_query_with_decay_half_life() {
+        let q = SearchQuery::new("test").with_decay_half_life(30.0);
+        assert_eq!(q.decay_half_life, Some(30.0));
+    }
+
+    #[test]
+    fn test_search_query_decay_chain() {
+        let q = SearchQuery::new("test")
+            .with_decay(true)
+            .with_decay_half_life(45.0)
+            .with_limit(5);
+        assert_eq!(q.decay, Some(true));
+        assert_eq!(q.decay_half_life, Some(45.0));
+        assert_eq!(q.limit, 5);
+    }
+
+    // --- SearchQuery decay_exclude/decay_include builder tests ---
+
+    #[test]
+    fn test_search_query_with_decay_exclude() {
+        let q = SearchQuery::new("test")
+            .with_decay_exclude(vec!["docs/reference".into(), "wiki/pinned".into()]);
+        assert_eq!(
+            q.decay_exclude,
+            Some(vec![
+                "docs/reference".to_string(),
+                "wiki/pinned".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_search_query_with_decay_include() {
+        let q = SearchQuery::new("test").with_decay_include(vec!["journal".into()]);
+        assert_eq!(q.decay_include, Some(vec!["journal".to_string()]));
+    }
+
+    // --- should_apply_decay tests ---
+
+    #[test]
+    fn test_should_apply_decay_empty_lists() {
+        assert!(should_apply_decay("docs/readme.md", &[], &[]));
+    }
+
+    #[test]
+    fn test_should_apply_decay_include_match() {
+        let include = vec!["journal/".to_string()];
+        assert!(should_apply_decay("journal/2024-01.md", &[], &include));
+    }
+
+    #[test]
+    fn test_should_apply_decay_include_no_match() {
+        let include = vec!["journal/".to_string()];
+        assert!(!should_apply_decay("docs/readme.md", &[], &include));
+    }
+
+    #[test]
+    fn test_should_apply_decay_exclude_match() {
+        let exclude = vec!["docs/reference".to_string()];
+        assert!(!should_apply_decay("docs/reference/api.md", &exclude, &[]));
+    }
+
+    #[test]
+    fn test_should_apply_decay_exclude_no_match() {
+        let exclude = vec!["docs/reference".to_string()];
+        assert!(should_apply_decay("docs/guides/setup.md", &exclude, &[]));
+    }
+
+    #[test]
+    fn test_should_apply_decay_exclude_overrides_include() {
+        let exclude = vec!["journal/pinned".to_string()];
+        let include = vec!["journal/".to_string()];
+        // Matches include but also matches exclude → excluded
+        assert!(!should_apply_decay(
+            "journal/pinned/important.md",
+            &exclude,
+            &include
+        ));
+        // Matches include and not exclude → included
+        assert!(should_apply_decay("journal/2024-01.md", &exclude, &include));
+    }
+
+    #[test]
+    fn test_should_apply_decay_multiple_patterns() {
+        let exclude = vec!["docs/reference".to_string(), "wiki/glossary".to_string()];
+        let include = vec!["docs/".to_string(), "wiki/".to_string()];
+        assert!(!should_apply_decay(
+            "docs/reference/api.md",
+            &exclude,
+            &include
+        ));
+        assert!(!should_apply_decay(
+            "wiki/glossary/terms.md",
+            &exclude,
+            &include
+        ));
+        assert!(should_apply_decay(
+            "docs/guides/setup.md",
+            &exclude,
+            &include
+        ));
+        assert!(should_apply_decay(
+            "wiki/articles/rust.md",
+            &exclude,
+            &include
+        ));
+        assert!(!should_apply_decay("notes/random.md", &exclude, &include));
+    }
+
+    // --- Cosine similarity tests ---
+
+    #[test]
+    fn test_cosine_similarity_identical_vectors() {
+        let v = vec![1.0_f32, 2.0, 3.0];
+        let sim = cosine_similarity(&v, &v);
+        assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_orthogonal_vectors() {
+        let a = vec![1.0_f32, 0.0, 0.0];
+        let b = vec![0.0_f32, 1.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!(sim.abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_similar_vectors() {
+        let a = vec![1.0_f32, 1.0, 0.0];
+        let b = vec![1.0_f32, 0.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        // cos(45°) = 1/√2
+        assert!((sim - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_empty_vectors() {
+        let empty: Vec<f32> = vec![];
+        assert_eq!(cosine_similarity(&empty, &empty), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_zero_vector() {
+        let a = vec![0.0_f32, 0.0, 0.0];
+        let b = vec![1.0_f32, 2.0, 3.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_mismatched_lengths() {
+        let a = vec![1.0_f32, 2.0];
+        let b = vec![1.0_f32, 2.0, 3.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    // --- Edge-weighted boost tests ---
+
+    #[test]
+    fn test_edge_boost_weight_used_in_multiplier() {
+        // With edge_boost_weight = 0.15 and no edge vectors, flat boost applies.
+        // Hop 1: 1.0 + 0.15 / 2^0 = 1.15
+        let weight = 0.15;
+        let distance = 1;
+        let multiplier = 1.0 + weight / 2.0_f64.powi(distance - 1);
+        assert!((multiplier - 1.15).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_edge_boost_weight_zero_disables_boost() {
+        // With edge_boost_weight = 0.0, multiplier should be 1.0 (no boost).
+        let weight = 0.0;
+        let distance = 1;
+        let multiplier = 1.0 + weight / 2.0_f64.powi(distance - 1);
+        assert!((multiplier - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_edge_weighted_boost_high_similarity_boosts_more() {
+        // An edge with high cosine similarity to query should boost more
+        // than one with low similarity.
+        let weight = 0.15;
+        let high_sim = 0.95;
+        let low_sim = 0.2;
+
+        let high_boost = weight * high_sim;
+        let low_boost = weight * low_sim;
+
+        let high_multiplier = 1.0 + high_boost / 2.0_f64.powi(0); // hop 1
+        let low_multiplier = 1.0 + low_boost / 2.0_f64.powi(0); // hop 1
+
+        assert!(
+            high_multiplier > low_multiplier,
+            "high sim edge ({high_multiplier}) should boost more than low sim ({low_multiplier})"
+        );
+        // High: 1.0 + 0.15 * 0.95 = 1.1425
+        assert!((high_multiplier - 1.1425).abs() < 1e-10);
+        // Low: 1.0 + 0.15 * 0.2 = 1.03
+        assert!((low_multiplier - 1.03).abs() < 1e-10);
+    }
+
+    // --- Edge-first retrieval tests ---
+
+    #[test]
+    fn test_assemble_edge_results_from_semantic_edges() {
+        let mut semantic_edges = HashMap::new();
+        semantic_edges.insert(
+            "edge:a.md->b.md@5".to_string(),
+            links::SemanticEdge {
+                edge_id: "edge:a.md->b.md@5".to_string(),
+                source: "a.md".to_string(),
+                target: "b.md".to_string(),
+                context_text: "See b.md for details".to_string(),
+                line_number: 5,
+                strength: Some(0.9),
+                relationship_type: Some("references".to_string()),
+                cluster_id: Some(1),
+            },
+        );
+        let lg = links::LinkGraph {
+            forward: HashMap::new(),
+            last_updated: 0,
+            semantic_edges: Some(semantic_edges),
+            edge_cluster_state: None,
+        };
+        let candidates = vec![("edge:a.md->b.md@5".to_string(), 0.85)];
+        let results = assemble_edge_results(&candidates, Some(&lg), None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].score, 0.85);
+        assert_eq!(results[0].source_path, "a.md");
+        assert_eq!(results[0].target_path, "b.md");
+        assert_eq!(results[0].context, "See b.md for details");
+        assert_eq!(results[0].relationship_type, Some("references".to_string()));
+        assert_eq!(results[0].cluster_id, Some(1));
+        assert_eq!(results[0].strength, Some(0.9));
+    }
+
+    #[test]
+    fn test_assemble_edge_results_fallback_parsing() {
+        // No link graph — falls back to parsing edge ID
+        let candidates = vec![("edge:x.md->y.md@10".to_string(), 0.7)];
+        let results = assemble_edge_results(&candidates, None, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_path, "x.md");
+        assert_eq!(results[0].target_path, "y.md");
+        assert!(results[0].context.is_empty());
+        assert!(results[0].relationship_type.is_none());
+    }
+
+    #[test]
+    fn test_assemble_edge_results_invalid_edge_id_skipped() {
+        let candidates = vec![("not-an-edge-id".to_string(), 0.5)];
+        let results = assemble_edge_results(&candidates, None, None);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_assemble_edge_results_empty_candidates() {
+        let results = assemble_edge_results(&[], None, None);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_assemble_edge_results_scopes_source_but_not_target() {
+        let candidates = vec![
+            ("edge:docs/a.md->outside/b.md@1".to_string(), 0.9),
+            ("edge:docs-old/a.md->docs/b.md@1".to_string(), 0.8),
+        ];
+
+        let results = assemble_edge_results(&candidates, None, Some("docs"));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_path, "docs/a.md");
+        assert_eq!(results[0].target_path, "outside/b.md");
+    }
+
+    #[test]
+    fn test_find_edge_context_found() {
+        let mut semantic_edges = HashMap::new();
+        semantic_edges.insert(
+            "edge:src.md->tgt.md@3".to_string(),
+            links::SemanticEdge {
+                edge_id: "edge:src.md->tgt.md@3".to_string(),
+                source: "src.md".to_string(),
+                target: "tgt.md".to_string(),
+                context_text: "This links to tgt".to_string(),
+                line_number: 3,
+                strength: None,
+                relationship_type: Some("extends".to_string()),
+                cluster_id: None,
+            },
+        );
+        let lg = links::LinkGraph {
+            forward: HashMap::new(),
+            last_updated: 0,
+            semantic_edges: Some(semantic_edges),
+            edge_cluster_state: None,
+        };
+        let (ctx, rel) = find_edge_context(&lg, "src.md", "tgt.md");
+        assert_eq!(ctx, Some("This links to tgt".to_string()));
+        assert_eq!(rel, Some("extends".to_string()));
+    }
+
+    #[test]
+    fn test_find_edge_context_not_found() {
+        let lg = links::LinkGraph {
+            forward: HashMap::new(),
+            last_updated: 0,
+            semantic_edges: None,
+            edge_cluster_state: None,
+        };
+        let (ctx, rel) = find_edge_context(&lg, "a.md", "b.md");
+        assert!(ctx.is_none());
+        assert!(rel.is_none());
+    }
+
+    #[test]
+    fn test_find_edge_context_empty_context_text() {
+        let mut semantic_edges = HashMap::new();
+        semantic_edges.insert(
+            "edge:a.md->b.md@1".to_string(),
+            links::SemanticEdge {
+                edge_id: "edge:a.md->b.md@1".to_string(),
+                source: "a.md".to_string(),
+                target: "b.md".to_string(),
+                context_text: String::new(),
+                line_number: 1,
+                strength: None,
+                relationship_type: None,
+                cluster_id: None,
+            },
+        );
+        let lg = links::LinkGraph {
+            forward: HashMap::new(),
+            last_updated: 0,
+            semantic_edges: Some(semantic_edges),
+            edge_cluster_state: None,
+        };
+        let (ctx, rel) = find_edge_context(&lg, "a.md", "b.md");
+        assert!(ctx.is_none()); // empty string becomes None
+        assert!(rel.is_none());
+    }
+
+    #[test]
+    fn test_edge_weighted_boost_decays_with_distance() {
+        let weight = 0.15;
+        let sim = 0.8;
+        let boost = weight * sim;
+
+        let m1 = 1.0 + boost / 2.0_f64.powi(0); // hop 1
+        let m2 = 1.0 + boost / 2.0_f64.powi(1); // hop 2
+        let m3 = 1.0 + boost / 2.0_f64.powi(2); // hop 3
+
+        assert!(m1 > m2);
+        assert!(m2 > m3);
+        assert!(m3 > 1.0);
+    }
+}

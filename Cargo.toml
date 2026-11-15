@@ -1,0 +1,70 @@
+[package]
+name = "mdvdb"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "mdvdb"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+serde_yaml = "0.9"
+yaml-edit = "0.2.3"
+dotenvy = "0.15"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pulldown-cmark = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+usearch = { version = "2", default-features = false, features = ["fp16lib"] }
+rkyv = { version = "0.8", features = ["bytecheck"] }
+memmap2 = "0.9"
+notify = "7"
+notify-debouncer-full = "0.4"
+sha2 = "0.10"
+parking_lot = "0.12"
+ndarray = "0.15"
+linfa = "0.7"
+linfa-clustering = "0.7"
+leiden-rs = { version = "0.8.1", default-features = false }
+rand = "0.8"
+rand_xoshiro = "0.6"
+rayon = "1"
+tiktoken-rs = "0.6"
+ignore = "0.4"
+async-trait = "0.1"
+futures = "0.3"
+colored = "2"
+regex = "1"
+unsafe-libyaml = "0.2"
+rust_decimal = { version = "1", features = ["maths", "serde-with-arbitrary-precision"] }
+rustix = { version = "0.38", features = ["fs"] }
+oxc_allocator = "0.139"
+oxc_ast = { version = "0.139", features = ["serialize"] }
+oxc_parser = "0.139"
+oxc_span = "0.139"
+indicatif = "0.17"
+dirs = "6"
+tantivy = "0.22"
+tempfile = "3"
+zstd = "0.13"
+semver = "1"
+# clap_complete = "4" # TODO: re-enable when available offline
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[features]
+default = ["simd"]
+simd = ["usearch/simsimd"]
+
+[dev-dependencies]
+serial_test = "3"
+# assert_cmd = "2" # TODO: re-enable when available offline
+# predicates = "3" # TODO: re-enable when available offline

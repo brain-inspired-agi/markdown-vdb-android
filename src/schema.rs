@@ -1,0 +1,2309 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
+
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tracing::debug;
+
+use crate::parser::MarkdownFile;
+
+/// The type of a frontmatter field, inferred from values across files.
+#[derive(Debug, Clone, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub enum FieldType {
+    String,
+    Number,
+    Boolean,
+    List,
+    Date,
+    Mixed,
+    /// A schema-only field whose value is calculated by the formula module.
+    Formula,
+    /// A frontmatter reference to another document (wiki link, markdown link,
+    /// or bare `.md` path — whole-value only). Serializes as `"Relation"`.
+    Relation,
+    /// A frontmatter reference to a collection-local, non-Markdown file.
+    File,
+    /// A structured JSON object or nested collection.
+    Json,
+    /// A schema-defined value copied from a field on a related document.
+    Lookup,
+    /// A schema-defined formula evaluated over values from related documents.
+    Rollup,
+}
+
+impl FieldType {
+    /// Whether values for this schema type are owned and materialized by a
+    /// built-in computed-field module rather than edited as ordinary metadata.
+    pub fn is_computed(&self) -> bool {
+        matches!(self, Self::Formula | Self::Lookup | Self::Rollup)
+    }
+}
+
+/// Direction used to collect documents for a Lookup or Rollup field.
+///
+/// Overlay YAML uses lowercase `outgoing` / `incoming`; API responses retain
+/// the crate's established PascalCase enum representation.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Serialize,
+    serde::Deserialize,
+)]
+#[rkyv(derive(Debug))]
+pub enum RelationDirection {
+    /// Follow the selected Relation field on the document being computed.
+    Outgoing,
+    /// Find documents in `relation_scope` whose selected Relation points back
+    /// to the document being computed. Supported by Rollup fields only.
+    Incoming,
+}
+
+/// The declared output type of a Formula or Rollup expression.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Serialize,
+    serde::Deserialize,
+)]
+#[rkyv(derive(Debug))]
+pub enum FormulaResultType {
+    String,
+    Number,
+    Boolean,
+    Date,
+    DateTime,
+    List,
+    Json,
+}
+
+impl std::fmt::Display for FormulaResultType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::String => "string",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::Date => "date",
+            Self::DateTime => "datetime",
+            Self::List => "list",
+            Self::Json => "json",
+        })
+    }
+}
+
+impl std::str::FromStr for FormulaResultType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_formula_result_type_str(value)
+            .ok_or_else(|| format!("unsupported formula result type `{value}`"))
+    }
+}
+
+/// Intermediate type used during inference to accumulate field information.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(derive(Debug))]
+pub struct InferredField {
+    /// Field name (frontmatter key).
+    pub name: String,
+    /// Inferred type from observed values.
+    pub field_type: FieldType,
+    /// Number of files containing this field.
+    pub occurrence_count: usize,
+    /// Up to 20 unique stringified sample values.
+    pub sample_values: Vec<String>,
+}
+
+/// A field definition from the user-provided overlay file.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OverlayField {
+    /// Human-readable description of the field.
+    pub description: Option<String>,
+    /// Type override as a string (e.g. "string", "number", "relation").
+    /// `type:` is accepted as an alias (live overlays already write it).
+    #[serde(alias = "type")]
+    pub field_type: Option<String>,
+    /// List of allowed values for this field.
+    pub allowed_values: Option<Vec<String>>,
+    /// Whether this field is considered required.
+    pub required: Option<bool>,
+    /// Target folder for relation fields (the FK's "table"). Accepts `clients`
+    /// or `clients/` on read; emitted slash-less. Implies `field_type: relation`.
+    pub target: Option<String>,
+    /// JavaScript-like expression evaluated for Formula and Rollup fields.
+    pub formula: Option<String>,
+    /// Declared Formula/Rollup output type (e.g. "number", "date_time", "json").
+    pub result_type: Option<String>,
+    /// Relation field used as the source of Lookup/Rollup related documents.
+    pub relation_field: Option<String>,
+    /// Exact top-level frontmatter field copied or aggregated from each target.
+    pub target_field: Option<String>,
+    /// Rollup traversal direction (`outgoing`, default, or `incoming`).
+    /// Lookup definitions always use outgoing traversal and reject this key.
+    pub relation_direction: Option<String>,
+    /// Folder containing documents scanned by an incoming Rollup. Required for
+    /// incoming traversal and forbidden for outgoing traversal.
+    pub relation_scope: Option<String>,
+}
+
+/// A scope's field overlay, defining field annotations for a path prefix.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ScopeOverlay {
+    /// Map from field name to overlay configuration for this scope.
+    pub fields: HashMap<String, OverlayField>,
+}
+
+/// Top-level structure for `.markdownvdb.schema.yml`.
+#[derive(Debug, serde::Deserialize)]
+pub struct OverlaySchema {
+    /// Map from field name to overlay configuration.
+    #[serde(default)]
+    pub fields: HashMap<String, OverlayField>,
+    /// Path-scoped field overlays.
+    #[serde(default)]
+    pub scopes: HashMap<String, ScopeOverlay>,
+}
+
+/// A merged schema field combining inferred data with overlay annotations.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct SchemaField {
+    /// Field name.
+    pub name: String,
+    /// Resolved field type (inferred or overridden by overlay).
+    pub field_type: FieldType,
+    /// Human-readable description from overlay.
+    pub description: Option<String>,
+    /// Number of files containing this field.
+    pub occurrence_count: usize,
+    /// Up to 20 unique sample values.
+    pub sample_values: Vec<String>,
+    /// Allowed values from overlay.
+    pub allowed_values: Option<Vec<String>>,
+    /// Whether this field is required (from overlay, defaults to false).
+    pub required: bool,
+    /// Overlay-declared FK target folder for relation fields (slash-less).
+    /// Serializes as `null` when absent (always-present JSON key per contract).
+    pub relation_target: Option<String>,
+    /// Expression for `Formula`/`Rollup` fields, otherwise `None`.
+    /// Serializes as `null` when absent.
+    pub formula: Option<String>,
+    /// Declared output type for `Formula`/`Rollup` fields, otherwise `None`.
+    /// Serializes as `null` when absent.
+    pub result_type: Option<FormulaResultType>,
+    /// Relation field selected by Lookup/Rollup definitions, otherwise `None`.
+    pub relation_field: Option<String>,
+    /// Exact target frontmatter field selected by Lookup/Rollup definitions.
+    pub target_field: Option<String>,
+    /// Effective traversal direction for Lookup/Rollup definitions.
+    pub relation_direction: Option<RelationDirection>,
+    /// Normalized incoming Rollup source folder (slash-less), otherwise `None`.
+    pub relation_scope: Option<String>,
+}
+
+/// A schema tagged with its path scope, persisted in the index.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct ScopedSchema {
+    /// Path prefix for this scope (e.g. "blog/").
+    pub scope: String,
+    /// The schema for files under this scope.
+    pub schema: Schema,
+}
+
+/// The complete metadata schema, persisted in the index.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct Schema {
+    /// Schema fields sorted alphabetically by name.
+    pub fields: Vec<SchemaField>,
+    /// Unix timestamp of when this schema was generated.
+    pub last_updated: u64,
+}
+
+/// Check if a string matches YYYY-MM-DD with optional T suffix for datetime.
+fn is_date_string(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 10 {
+        return false;
+    }
+    bytes[0..4].iter().all(|b| b.is_ascii_digit())
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(|b| b.is_ascii_digit())
+        && (bytes.len() == 10 || bytes[10] == b'T')
+}
+
+/// Infer a `FieldType` from a single `serde_json::Value`.
+///
+/// Link rules run ahead of the plain arms: Markdown targets classify as
+/// `Relation`, while targets with an explicit non-Markdown extension classify
+/// as `File`. Homogeneous arrays retain that type; arrays mixing both classify
+/// as `Mixed`. Arrays containing nested arrays/objects are `Json`; empty and
+/// scalar arrays remain `List`.
+pub(crate) fn infer_field_type(value: &serde_json::Value) -> FieldType {
+    match value {
+        serde_json::Value::Bool(_) => FieldType::Boolean,
+        serde_json::Value::Number(_) => FieldType::Number,
+        serde_json::Value::String(s) => {
+            if let Some(kind) = crate::relations::link_kind(s) {
+                match kind {
+                    crate::relations::FrontmatterLinkKind::Relation => FieldType::Relation,
+                    crate::relations::FrontmatterLinkKind::File => FieldType::File,
+                }
+            } else if is_date_string(s) {
+                FieldType::Date
+            } else {
+                FieldType::String
+            }
+        }
+        serde_json::Value::Array(items) => {
+            if items.is_empty() {
+                return FieldType::List;
+            }
+            if items.iter().any(|item| {
+                matches!(
+                    item,
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_)
+                )
+            }) {
+                return FieldType::Json;
+            }
+            let kinds: Option<Vec<_>> = items
+                .iter()
+                .map(|value| match value {
+                    serde_json::Value::String(s) => crate::relations::link_kind(s),
+                    _ => None,
+                })
+                .collect();
+            match kinds {
+                Some(kinds)
+                    if kinds
+                        .iter()
+                        .all(|kind| *kind == crate::relations::FrontmatterLinkKind::Relation) =>
+                {
+                    FieldType::Relation
+                }
+                Some(kinds)
+                    if kinds
+                        .iter()
+                        .all(|kind| *kind == crate::relations::FrontmatterLinkKind::File) =>
+                {
+                    FieldType::File
+                }
+                Some(_) => FieldType::Mixed,
+                None => FieldType::List,
+            }
+        }
+        serde_json::Value::Object(_) => FieldType::Json,
+        serde_json::Value::Null => FieldType::String, // null defaults to string
+    }
+}
+
+/// Stringify a `serde_json::Value` for sample collection.
+fn value_to_sample_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Convert an overlay type string to a `FieldType`.
+pub(crate) fn parse_field_type_str(s: &str) -> Option<FieldType> {
+    match s.to_lowercase().as_str() {
+        "string" => Some(FieldType::String),
+        "number" => Some(FieldType::Number),
+        "boolean" | "bool" => Some(FieldType::Boolean),
+        "list" | "array" => Some(FieldType::List),
+        "date" => Some(FieldType::Date),
+        "mixed" => Some(FieldType::Mixed),
+        "json" => Some(FieldType::Json),
+        "formula" => Some(FieldType::Formula),
+        "relation" => Some(FieldType::Relation),
+        "file" => Some(FieldType::File),
+        "lookup" => Some(FieldType::Lookup),
+        "rollup" => Some(FieldType::Rollup),
+        _ => None,
+    }
+}
+
+/// Convert an overlay traversal direction to a [`RelationDirection`].
+pub fn parse_relation_direction_str(s: &str) -> Option<RelationDirection> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "outgoing" => Some(RelationDirection::Outgoing),
+        "incoming" => Some(RelationDirection::Incoming),
+        _ => None,
+    }
+}
+
+/// Convert an overlay result type string to a [`FormulaResultType`].
+pub fn parse_formula_result_type_str(s: &str) -> Option<FormulaResultType> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "string" => Some(FormulaResultType::String),
+        "number" => Some(FormulaResultType::Number),
+        "boolean" | "bool" => Some(FormulaResultType::Boolean),
+        "date" => Some(FormulaResultType::Date),
+        "datetime" | "date_time" | "date-time" => Some(FormulaResultType::DateTime),
+        "list" | "array" => Some(FormulaResultType::List),
+        "json" => Some(FormulaResultType::Json),
+        _ => None,
+    }
+}
+
+fn validate_overlay_field(location: &str, name: &str, field: &OverlayField) -> crate::Result<()> {
+    let parsed_field_type = match field.field_type.as_deref() {
+        Some(field_type) => Some(parse_field_type_str(field_type).ok_or_else(|| {
+            crate::error::Error::Config(format!(
+                "invalid field_type `{field_type}` for `{location}.{name}`"
+            ))
+        })?),
+        None => None,
+    };
+    let is_formula = matches!(parsed_field_type.as_ref(), Some(FieldType::Formula));
+    let is_lookup = matches!(parsed_field_type.as_ref(), Some(FieldType::Lookup));
+    let is_rollup = matches!(parsed_field_type.as_ref(), Some(FieldType::Rollup));
+    let is_computed = is_formula || is_lookup || is_rollup;
+
+    if is_computed && matches!(name, "title" | "path") {
+        let kind = if is_formula {
+            "formula"
+        } else if is_lookup {
+            "lookup"
+        } else {
+            "rollup"
+        };
+        return Err(crate::error::Error::Config(format!(
+            "`{name}` is reserved and cannot be a {kind} field in `{location}`"
+        )));
+    }
+
+    if is_formula || is_rollup {
+        let kind = if is_formula { "formula" } else { "rollup" };
+        if field
+            .formula
+            .as_deref()
+            .is_none_or(|formula| formula.trim().is_empty())
+        {
+            return Err(crate::error::Error::Config(format!(
+                "{kind} field `{location}.{name}` requires a non-empty `formula`"
+            )));
+        }
+
+        let result_type = field.result_type.as_deref().ok_or_else(|| {
+            crate::error::Error::Config(format!(
+                "{kind} field `{location}.{name}` requires `result_type`"
+            ))
+        })?;
+        if parse_formula_result_type_str(result_type).is_none() {
+            return Err(crate::error::Error::Config(format!(
+                "invalid result_type `{result_type}` for {kind} field `{location}.{name}`"
+            )));
+        }
+    } else {
+        if field.formula.is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "`formula` on `{location}.{name}` requires `field_type: formula` or `field_type: rollup`"
+            )));
+        }
+        if field.result_type.is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "`result_type` on `{location}.{name}` requires `field_type: formula` or `field_type: rollup`"
+            )));
+        }
+    }
+
+    if is_lookup || is_rollup {
+        let kind = if is_lookup { "lookup" } else { "rollup" };
+        let relation_field = field
+            .relation_field
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                crate::error::Error::Config(format!(
+                    "{kind} field `{location}.{name}` requires `relation_field`"
+                ))
+            })?;
+        if relation_field.trim() == name {
+            return Err(crate::error::Error::Config(format!(
+                "{kind} field `{location}.{name}` cannot use itself as `relation_field`"
+            )));
+        }
+        field
+            .target_field
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                crate::error::Error::Config(format!(
+                    "{kind} field `{location}.{name}` requires `target_field`"
+                ))
+            })?;
+        if field.target.is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "{kind} field `{location}.{name}` cannot declare a relation `target`"
+            )));
+        }
+    } else {
+        if field.relation_field.is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "`relation_field` on `{location}.{name}` requires `field_type: lookup` or `field_type: rollup`"
+            )));
+        }
+        if field.target_field.is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "`target_field` on `{location}.{name}` requires `field_type: lookup` or `field_type: rollup`"
+            )));
+        }
+    }
+
+    if is_formula && field.target.is_some() {
+        return Err(crate::error::Error::Config(format!(
+            "formula field `{location}.{name}` cannot declare a relation `target`"
+        )));
+    }
+
+    if is_lookup {
+        if field.relation_direction.is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "lookup field `{location}.{name}` is always outgoing and cannot declare `relation_direction`"
+            )));
+        }
+        if field.relation_scope.is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "lookup field `{location}.{name}` is always outgoing and cannot declare `relation_scope`"
+            )));
+        }
+    } else if is_rollup {
+        let direction = match field.relation_direction.as_deref() {
+            Some(value) => parse_relation_direction_str(value).ok_or_else(|| {
+                crate::error::Error::Config(format!(
+                    "invalid relation_direction `{value}` for rollup field `{location}.{name}`"
+                ))
+            })?,
+            None => RelationDirection::Outgoing,
+        };
+        match direction {
+            RelationDirection::Outgoing if field.relation_scope.is_some() => {
+                return Err(crate::error::Error::Config(format!(
+                    "outgoing rollup field `{location}.{name}` cannot declare `relation_scope`"
+                )));
+            }
+            RelationDirection::Incoming
+                if field
+                    .relation_scope
+                    .as_deref()
+                    .and_then(normalize_relation_scope)
+                    .is_none() =>
+            {
+                return Err(crate::error::Error::Config(format!(
+                    "incoming rollup field `{location}.{name}` requires a non-empty `relation_scope`"
+                )));
+            }
+            _ => {}
+        }
+    } else {
+        if field.relation_direction.is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "`relation_direction` on `{location}.{name}` requires `field_type: rollup`"
+            )));
+        }
+        if field.relation_scope.is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "`relation_scope` on `{location}.{name}` requires an incoming rollup"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_overlay(overlay: &OverlaySchema) -> crate::Result<()> {
+    for (name, field) in &overlay.fields {
+        validate_overlay_field("fields", name, field)?;
+    }
+    for (scope, scope_overlay) in &overlay.scopes {
+        for (name, field) in &scope_overlay.fields {
+            validate_overlay_field(&format!("scopes.{scope}.fields"), name, field)?;
+        }
+    }
+    Ok(())
+}
+
+/// Normalize an overlay `target:` folder: trim whitespace and a trailing `/`.
+/// Returns `None` for empty results (never emit an empty target).
+fn normalize_target(target: &str) -> Option<String> {
+    let t = target.trim().trim_end_matches('/');
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+pub(crate) fn normalize_field_reference(field: &str) -> Option<String> {
+    let field = field.trim();
+    (!field.is_empty()).then(|| field.to_string())
+}
+
+pub(crate) fn normalize_relation_scope(scope: &str) -> Option<String> {
+    let scope = crate::path_util::normalize_path_input(scope.trim());
+    let scope = scope.strip_prefix("./").unwrap_or(&scope).trim_matches('/');
+    if scope.is_empty()
+        || scope == "."
+        || scope
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        None
+    } else {
+        Some(scope.to_string())
+    }
+}
+
+impl Schema {
+    /// Auto-infer a schema from frontmatter across all provided files.
+    pub fn infer(files: &[MarkdownFile]) -> Self {
+        Self::infer_from_iter(files.iter())
+    }
+
+    /// Infer a schema from frontmatter across files matching a path prefix.
+    ///
+    /// Files whose path is equal to or below `path_prefix` are included.
+    /// Matching is path-segment-aware (`docs` never includes `docs-old`).
+    pub fn infer_scoped(files: &[MarkdownFile], path_prefix: &str) -> Self {
+        let filtered = files.iter().filter(|f| {
+            crate::path_util::path_is_in_scope(&crate::path_util::to_slash(&f.path), path_prefix)
+        });
+        Self::infer_from_iter(filtered)
+    }
+
+    /// Discover unique top-level directory scopes from the file paths.
+    ///
+    /// Returns sorted unique first path components that are directories
+    /// (i.e., paths containing a `/`).
+    pub fn discover_scopes(files: &[MarkdownFile]) -> Vec<String> {
+        let mut scopes: BTreeMap<String, ()> = BTreeMap::new();
+        for file in files {
+            let path_str = crate::path_util::to_slash(&file.path);
+            if let Some(idx) = path_str.find('/') {
+                let top = &path_str[..idx];
+                scopes.entry(top.to_string()).or_default();
+            }
+        }
+        scopes.into_keys().collect()
+    }
+
+    /// Core inference logic operating over any iterator of `&MarkdownFile`.
+    pub fn infer_from_iter<'a>(files: impl IntoIterator<Item = &'a MarkdownFile>) -> Self {
+        Self::infer_from_frontmatter_iter(
+            files
+                .into_iter()
+                .filter_map(|file| file.frontmatter.as_ref()),
+        )
+    }
+
+    /// Infer schema metadata directly from raw frontmatter JSON values already
+    /// persisted in the index.
+    pub(crate) fn infer_from_frontmatter_iter<'a>(
+        frontmatters: impl IntoIterator<Item = &'a serde_json::Value>,
+    ) -> Self {
+        // Track per-field: types seen, occurrence count, sample values
+        let mut field_types: HashMap<String, HashSet<std::mem::Discriminant<FieldType>>> =
+            HashMap::new();
+        let mut field_type_values: HashMap<String, FieldType> = HashMap::new();
+        let mut occurrence_counts: HashMap<String, usize> = HashMap::new();
+        let mut sample_values: HashMap<String, HashSet<String>> = HashMap::new();
+
+        for frontmatter in frontmatters {
+            let frontmatter = match frontmatter {
+                serde_json::Value::Object(map) => map,
+                _ => continue,
+            };
+
+            for (key, value) in frontmatter {
+                // Skip null values for type inference
+                if value.is_null() {
+                    continue;
+                }
+
+                let ft = infer_field_type(value);
+                let discriminant = std::mem::discriminant(&ft);
+
+                let types = field_types.entry(key.clone()).or_default();
+                types.insert(discriminant);
+
+                // Store the latest type; if multiple types seen, it becomes Mixed
+                field_type_values.insert(key.clone(), ft);
+
+                *occurrence_counts.entry(key.clone()).or_insert(0) += 1;
+
+                let samples = sample_values.entry(key.clone()).or_default();
+                if samples.len() < 20 {
+                    samples.insert(value_to_sample_string(value));
+                }
+            }
+        }
+
+        // Build fields sorted alphabetically
+        let mut field_names: Vec<String> = field_types.keys().cloned().collect();
+        field_names.sort();
+
+        let fields = field_names
+            .into_iter()
+            .map(|name| {
+                let types = &field_types[&name];
+                let field_type = if types.len() > 1 {
+                    FieldType::Mixed
+                } else {
+                    field_type_values
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(FieldType::String)
+                };
+
+                let mut samples: Vec<String> = sample_values
+                    .remove(&name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                samples.sort();
+
+                SchemaField {
+                    name: name.clone(),
+                    field_type,
+                    description: None,
+                    occurrence_count: occurrence_counts.get(&name).copied().unwrap_or(0),
+                    sample_values: samples,
+                    allowed_values: None,
+                    required: false,
+                    relation_target: None,
+                    formula: None,
+                    result_type: None,
+                    relation_field: None,
+                    target_field: None,
+                    relation_direction: None,
+                    relation_scope: None,
+                }
+            })
+            .collect();
+
+        let last_updated = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        debug!(
+            field_count = field_types.len(),
+            "schema inferred from frontmatter"
+        );
+
+        Schema {
+            fields,
+            last_updated,
+        }
+    }
+
+    /// Load an optional overlay from `.markdownvdb.schema.yml` in the project root.
+    pub fn load_overlay(project_root: &Path) -> crate::Result<Option<OverlaySchema>> {
+        Self::load_overlay_with_fingerprint(project_root).map(|(overlay, _)| overlay)
+    }
+
+    /// Load and validate the overlay from one exact byte snapshot, returning a
+    /// fingerprint suitable for module input metadata and pre-write CAS.
+    pub(crate) fn load_overlay_with_fingerprint(
+        project_root: &Path,
+    ) -> crate::Result<(Option<OverlaySchema>, String)> {
+        let path = project_root.join(".markdownvdb.schema.yml");
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                debug!("no schema overlay file found at {}", path.display());
+                return Ok((None, "missing".to_string()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let fingerprint = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let contents = std::str::from_utf8(&bytes).map_err(|error| {
+            crate::error::Error::Config(format!(
+                "failed to read {} as UTF-8: {error}",
+                path.display()
+            ))
+        })?;
+        let overlay: OverlaySchema = serde_yaml::from_str(contents).map_err(|e| {
+            crate::error::Error::Config(format!("failed to parse {}: {e}", path.display()))
+        })?;
+        validate_overlay(&overlay)?;
+
+        debug!(field_count = overlay.fields.len(), "loaded schema overlay");
+        Ok((Some(overlay), fingerprint))
+    }
+
+    /// Fingerprint the current overlay bytes without parsing them.
+    pub(crate) fn overlay_source_fingerprint(project_root: &Path) -> crate::Result<String> {
+        let path = project_root.join(".markdownvdb.schema.yml");
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(format!("sha256:{:x}", Sha256::digest(bytes))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("missing".to_string()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Resolve overlay fields for a given path prefix.
+    /// Returns global fields merged with all matching scope fields,
+    /// sorted by prefix length (shortest first, more specific overrides).
+    pub fn resolve_overlay_for_path(
+        overlay: &OverlaySchema,
+        path_prefix: Option<&str>,
+    ) -> HashMap<String, OverlayField> {
+        // Start with global fields
+        let mut resolved = overlay.fields.clone();
+
+        // If no path prefix, return global fields only
+        let prefix = match path_prefix {
+            Some(p) => p,
+            None => return resolved,
+        };
+
+        // Collect matching scopes and sort by prefix length (shortest first)
+        let normalized_prefix = prefix.trim_matches('/');
+        let mut matching_scopes: Vec<(&str, &ScopeOverlay)> = overlay
+            .scopes
+            .iter()
+            .filter(|(scope, _)| crate::path_util::path_is_in_scope(normalized_prefix, scope))
+            .map(|(s, o)| (s.as_str(), o))
+            .collect();
+        matching_scopes.sort_by_key(|(scope, _)| scope.len());
+
+        // Layer matching scope fields on top (more specific overrides less specific)
+        for (_, scope_overlay) in matching_scopes {
+            for (name, field) in &scope_overlay.fields {
+                resolved.insert(name.clone(), field.clone());
+            }
+        }
+
+        resolved
+    }
+
+    /// Merge an inferred schema with an optional overlay.
+    pub fn merge(inferred: Self, overlay: Option<HashMap<String, OverlayField>>) -> Self {
+        let overlay = match overlay {
+            Some(o) => o,
+            None => return inferred,
+        };
+
+        // Start with inferred fields in a BTreeMap for alphabetical ordering
+        let mut merged: BTreeMap<String, SchemaField> = BTreeMap::new();
+        for field in inferred.fields {
+            merged.insert(field.name.clone(), field);
+        }
+
+        // Apply overlay
+        for (name, ov) in &overlay {
+            let target = ov.target.as_deref().and_then(normalize_target);
+            let formula_result_type = ov
+                .result_type
+                .as_deref()
+                .and_then(parse_formula_result_type_str);
+            let relation_field = ov
+                .relation_field
+                .as_deref()
+                .and_then(normalize_field_reference);
+            let target_field = ov
+                .target_field
+                .as_deref()
+                .and_then(normalize_field_reference);
+            if let Some(field) = merged.get_mut(name) {
+                let previous_field_type = field.field_type.clone();
+                // Apply overlay to existing inferred field
+                if let Some(desc) = &ov.description {
+                    field.description = Some(desc.clone());
+                }
+                if let Some(type_str) = &ov.field_type {
+                    if let Some(ft) = parse_field_type_str(type_str) {
+                        field.field_type = ft;
+                    }
+                } else if target.is_some() {
+                    // A declared target with no explicit type implies Relation.
+                    field.field_type = FieldType::Relation;
+                }
+                if let Some(av) = &ov.allowed_values {
+                    field.allowed_values = Some(av.clone());
+                }
+                if let Some(req) = ov.required {
+                    field.required = req;
+                }
+                field.relation_target = if field.field_type == FieldType::Relation {
+                    target
+                } else {
+                    None
+                };
+                let is_formula = field.field_type == FieldType::Formula;
+                let is_lookup = field.field_type == FieldType::Lookup;
+                let is_rollup = field.field_type == FieldType::Rollup;
+                if is_formula || is_rollup {
+                    field.formula = ov.formula.clone();
+                    field.result_type = formula_result_type;
+                } else {
+                    field.formula = None;
+                    field.result_type = None;
+                }
+                if is_lookup || is_rollup {
+                    field.relation_field = relation_field.clone();
+                    field.target_field = target_field.clone();
+                    field.relation_direction = Some(if is_lookup {
+                        RelationDirection::Outgoing
+                    } else {
+                        ov.relation_direction
+                            .as_deref()
+                            .and_then(parse_relation_direction_str)
+                            .unwrap_or(RelationDirection::Outgoing)
+                    });
+                    field.relation_scope =
+                        if field.relation_direction == Some(RelationDirection::Incoming) {
+                            ov.relation_scope
+                                .as_deref()
+                                .and_then(normalize_relation_scope)
+                        } else {
+                            None
+                        };
+                } else {
+                    field.relation_field = None;
+                    field.target_field = None;
+                    field.relation_direction = None;
+                    field.relation_scope = None;
+                }
+                // Computed samples/counts come from successful module-owned
+                // results, never from a colliding materialized/raw field.
+                if field.field_type.is_computed() && previous_field_type != field.field_type {
+                    field.occurrence_count = 0;
+                    field.sample_values.clear();
+                }
+            } else {
+                // Overlay-only field: not seen in any file
+                let field_type = ov
+                    .field_type
+                    .as_deref()
+                    .and_then(parse_field_type_str)
+                    .unwrap_or(if target.is_some() {
+                        FieldType::Relation
+                    } else {
+                        FieldType::String
+                    });
+                let relation_target = if field_type == FieldType::Relation {
+                    target
+                } else {
+                    None
+                };
+                let is_formula = field_type == FieldType::Formula;
+                let is_lookup = field_type == FieldType::Lookup;
+                let is_rollup = field_type == FieldType::Rollup;
+                let relation_direction = if is_lookup {
+                    Some(RelationDirection::Outgoing)
+                } else if is_rollup {
+                    Some(
+                        ov.relation_direction
+                            .as_deref()
+                            .and_then(parse_relation_direction_str)
+                            .unwrap_or(RelationDirection::Outgoing),
+                    )
+                } else {
+                    None
+                };
+                let relation_scope = if relation_direction == Some(RelationDirection::Incoming) {
+                    ov.relation_scope
+                        .as_deref()
+                        .and_then(normalize_relation_scope)
+                } else {
+                    None
+                };
+
+                merged.insert(
+                    name.clone(),
+                    SchemaField {
+                        name: name.clone(),
+                        field_type,
+                        description: ov.description.clone(),
+                        occurrence_count: 0,
+                        sample_values: vec![],
+                        allowed_values: ov.allowed_values.clone(),
+                        required: ov.required.unwrap_or(false),
+                        relation_target,
+                        formula: if is_formula || is_rollup {
+                            ov.formula.clone()
+                        } else {
+                            None
+                        },
+                        result_type: if is_formula || is_rollup {
+                            formula_result_type
+                        } else {
+                            None
+                        },
+                        relation_field: if is_lookup || is_rollup {
+                            relation_field
+                        } else {
+                            None
+                        },
+                        target_field: if is_lookup || is_rollup {
+                            target_field
+                        } else {
+                            None
+                        },
+                        relation_direction,
+                        relation_scope,
+                    },
+                );
+            }
+        }
+
+        let fields: Vec<SchemaField> = merged.into_values().collect();
+
+        debug!(field_count = fields.len(), "schema merged with overlay");
+
+        Schema {
+            fields,
+            last_updated: inferred.last_updated,
+        }
+    }
+
+    /// Upgrade persisted schemas written before non-Markdown wiki links had a
+    /// dedicated `File` type. Old indexes may store these fields as
+    /// `Relation`; their retained samples are enough to safely distinguish
+    /// homogeneous File-link fields. Explicit live overlays are applied after
+    /// this migration and therefore remain authoritative.
+    pub(crate) fn reclassify_legacy_file_fields(mut self) -> Self {
+        for field in &mut self.fields {
+            if field.field_type != FieldType::Relation || field.sample_values.is_empty() {
+                continue;
+            }
+
+            let all_file_samples = field.sample_values.iter().all(|sample| {
+                let value = serde_json::from_str::<serde_json::Value>(sample)
+                    .unwrap_or_else(|_| serde_json::Value::String(sample.clone()));
+                infer_field_type(&value) == FieldType::File
+            });
+            if all_file_samples {
+                field.field_type = FieldType::File;
+                field.relation_target = None;
+            }
+        }
+        self
+    }
+
+    /// Look up a field by name.
+    pub fn get_field(&self, name: &str) -> Option<&SchemaField> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+
+    /// Return all field names in the schema.
+    pub fn field_names(&self) -> Vec<&str> {
+        self.fields.iter().map(|f| f.name.as_str()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_date_string_valid_date() {
+        assert!(is_date_string("2024-01-15"));
+    }
+
+    #[test]
+    fn is_date_string_valid_datetime() {
+        assert!(is_date_string("2024-01-15T10:30:00"));
+    }
+
+    #[test]
+    fn is_date_string_not_a_date() {
+        assert!(!is_date_string("not-a-date"));
+    }
+
+    #[test]
+    fn is_date_string_too_short() {
+        assert!(!is_date_string("2024-01"));
+    }
+
+    #[test]
+    fn parse_field_type_str_variants() {
+        assert_eq!(parse_field_type_str("string"), Some(FieldType::String));
+        assert_eq!(parse_field_type_str("number"), Some(FieldType::Number));
+        assert_eq!(parse_field_type_str("boolean"), Some(FieldType::Boolean));
+        assert_eq!(parse_field_type_str("bool"), Some(FieldType::Boolean));
+        assert_eq!(parse_field_type_str("list"), Some(FieldType::List));
+        assert_eq!(parse_field_type_str("array"), Some(FieldType::List));
+        assert_eq!(parse_field_type_str("date"), Some(FieldType::Date));
+        assert_eq!(parse_field_type_str("mixed"), Some(FieldType::Mixed));
+        assert_eq!(parse_field_type_str("json"), Some(FieldType::Json));
+        assert_eq!(parse_field_type_str("formula"), Some(FieldType::Formula));
+        assert_eq!(parse_field_type_str("lookup"), Some(FieldType::Lookup));
+        assert_eq!(parse_field_type_str("ROLLUP"), Some(FieldType::Rollup));
+        assert_eq!(parse_field_type_str("unknown"), None);
+        assert_eq!(serde_json::to_string(&FieldType::Json).unwrap(), "\"Json\"");
+        assert_eq!(
+            serde_json::to_string(&FieldType::Lookup).unwrap(),
+            "\"Lookup\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FieldType::Rollup).unwrap(),
+            "\"Rollup\""
+        );
+        assert!(FieldType::Formula.is_computed());
+        assert!(FieldType::Lookup.is_computed());
+        assert!(FieldType::Rollup.is_computed());
+        assert!(!FieldType::Relation.is_computed());
+    }
+
+    #[test]
+    fn relation_direction_parsing_and_serialization() {
+        assert_eq!(
+            parse_relation_direction_str(" outgoing "),
+            Some(RelationDirection::Outgoing)
+        );
+        assert_eq!(
+            parse_relation_direction_str("INCOMING"),
+            Some(RelationDirection::Incoming)
+        );
+        assert_eq!(parse_relation_direction_str("sideways"), None);
+        assert_eq!(
+            serde_json::to_string(&RelationDirection::Incoming).unwrap(),
+            "\"Incoming\""
+        );
+    }
+
+    #[test]
+    fn lookup_rollup_reference_normalization_is_safe_and_canonical() {
+        assert_eq!(
+            normalize_field_reference(" client ").as_deref(),
+            Some("client")
+        );
+        assert_eq!(normalize_field_reference("  "), None);
+        assert_eq!(
+            normalize_relation_scope(r" ./invoices\paid/ ").as_deref(),
+            Some("invoices/paid")
+        );
+        for invalid in [
+            "",
+            "/",
+            ".",
+            "./",
+            "../invoices",
+            "invoices/../clients",
+            "invoices//paid",
+        ] {
+            assert_eq!(normalize_relation_scope(invalid), None, "scope: {invalid}");
+        }
+    }
+
+    #[test]
+    fn formula_result_type_parsing_and_display() {
+        assert_eq!(
+            parse_formula_result_type_str("string"),
+            Some(FormulaResultType::String)
+        );
+        assert_eq!(
+            parse_formula_result_type_str("BOOL"),
+            Some(FormulaResultType::Boolean)
+        );
+        assert_eq!(
+            parse_formula_result_type_str("date_time"),
+            Some(FormulaResultType::DateTime)
+        );
+        assert_eq!(
+            parse_formula_result_type_str("date-time"),
+            Some(FormulaResultType::DateTime)
+        );
+        assert_eq!(
+            "json".parse::<FormulaResultType>().unwrap(),
+            FormulaResultType::Json
+        );
+        assert_eq!(FormulaResultType::DateTime.to_string(), "datetime");
+        assert!("unknown".parse::<FormulaResultType>().is_err());
+    }
+
+    #[test]
+    fn field_type_clone_and_eq() {
+        let a = FieldType::Date;
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    fn make_file(frontmatter: serde_json::Value) -> MarkdownFile {
+        MarkdownFile {
+            path: std::path::PathBuf::from("test.md"),
+            frontmatter: Some(frontmatter),
+            headings: vec![],
+            body: String::new(),
+            content_hash: String::new(),
+            file_size: 0,
+            links: Vec::new(),
+            modified_at: 0,
+            frontmatter_links: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn infer_field_type_from_value() {
+        assert_eq!(
+            infer_field_type(&serde_json::json!(true)),
+            FieldType::Boolean
+        );
+        assert_eq!(infer_field_type(&serde_json::json!(42)), FieldType::Number);
+        assert_eq!(
+            infer_field_type(&serde_json::json!("hello")),
+            FieldType::String
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!("2024-01-15")),
+            FieldType::Date
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!(["a", "b"])),
+            FieldType::List
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!({"nested": true})),
+            FieldType::Json
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!([{"nested": true}])),
+            FieldType::Json
+        );
+    }
+
+    #[test]
+    fn infer_empty_files() {
+        let schema = Schema::infer(&[]);
+        assert!(schema.fields.is_empty());
+    }
+
+    #[test]
+    fn infer_basic_fields() {
+        let files = vec![
+            make_file(serde_json::json!({"title": "Hello", "count": 5})),
+            make_file(serde_json::json!({"title": "World", "tags": ["a"]})),
+        ];
+        let schema = Schema::infer(&files);
+        assert_eq!(schema.fields.len(), 3);
+        // Alphabetically sorted
+        assert_eq!(schema.fields[0].name, "count");
+        assert_eq!(schema.fields[0].field_type, FieldType::Number);
+        assert_eq!(schema.fields[0].occurrence_count, 1);
+        assert_eq!(schema.fields[1].name, "tags");
+        assert_eq!(schema.fields[1].field_type, FieldType::List);
+        assert_eq!(schema.fields[2].name, "title");
+        assert_eq!(schema.fields[2].field_type, FieldType::String);
+        assert_eq!(schema.fields[2].occurrence_count, 2);
+    }
+
+    #[test]
+    fn infer_mixed_types() {
+        let files = vec![
+            make_file(serde_json::json!({"value": "text"})),
+            make_file(serde_json::json!({"value": 42})),
+        ];
+        let schema = Schema::infer(&files);
+        assert_eq!(schema.fields[0].field_type, FieldType::Mixed);
+    }
+
+    #[test]
+    fn infer_date_field() {
+        let files = vec![
+            make_file(serde_json::json!({"created": "2024-01-15"})),
+            make_file(serde_json::json!({"created": "2024-06-01T10:00:00"})),
+        ];
+        let schema = Schema::infer(&files);
+        assert_eq!(schema.fields[0].field_type, FieldType::Date);
+    }
+
+    #[test]
+    fn infer_sample_values_capped() {
+        let files: Vec<MarkdownFile> = (0..30)
+            .map(|i| make_file(serde_json::json!({"tag": format!("val-{i}")})))
+            .collect();
+        let schema = Schema::infer(&files);
+        assert!(schema.fields[0].sample_values.len() <= 20);
+    }
+
+    #[test]
+    fn infer_skips_no_frontmatter() {
+        let mut file = make_file(serde_json::json!(null));
+        file.frontmatter = None;
+        let schema = Schema::infer(&[file]);
+        assert!(schema.fields.is_empty());
+    }
+
+    #[test]
+    fn infer_sample_values_deduplicated() {
+        let files = vec![
+            make_file(serde_json::json!({"status": "draft"})),
+            make_file(serde_json::json!({"status": "draft"})),
+            make_file(serde_json::json!({"status": "published"})),
+        ];
+        let schema = Schema::infer(&files);
+        let field = &schema.fields[0];
+        assert_eq!(field.occurrence_count, 3);
+        assert_eq!(field.sample_values.len(), 2);
+        assert!(field.sample_values.contains(&"draft".to_string()));
+        assert!(field.sample_values.contains(&"published".to_string()));
+    }
+
+    #[test]
+    fn infer_null_values_skipped() {
+        let files = vec![make_file(
+            serde_json::json!({"title": "Hello", "opt": null}),
+        )];
+        let schema = Schema::infer(&files);
+        // "opt" field has null value, which is skipped entirely
+        assert_eq!(schema.fields.len(), 1);
+        assert_eq!(schema.fields[0].name, "title");
+    }
+
+    #[test]
+    fn infer_nested_objects_as_json() {
+        let files = vec![make_file(serde_json::json!({"meta": {"nested": "value"}}))];
+        let schema = Schema::infer(&files);
+        assert_eq!(schema.fields[0].name, "meta");
+        assert_eq!(schema.fields[0].field_type, FieldType::Json);
+    }
+
+    #[test]
+    fn load_overlay_missing_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = Schema::load_overlay(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_overlay_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+fields:
+  title:
+    description: "The document title"
+    field_type: string
+    required: true
+  status:
+    allowed_values: ["draft", "published"]
+"#;
+        std::fs::write(dir.path().join(".markdownvdb.schema.yml"), yaml).unwrap();
+        let result = Schema::load_overlay(dir.path()).unwrap().unwrap();
+        assert_eq!(result.fields.len(), 2);
+        assert_eq!(
+            result.fields["title"].description.as_deref(),
+            Some("The document title")
+        );
+        assert_eq!(result.fields["title"].required, Some(true));
+        assert!(result.fields["status"].allowed_values.is_some());
+    }
+
+    #[test]
+    fn load_overlay_invalid_yaml_returns_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".markdownvdb.schema.yml"),
+            "not: [valid: yaml: !!",
+        )
+        .unwrap();
+        let err = Schema::load_overlay(dir.path()).unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+    }
+
+    #[test]
+    fn load_and_merge_scoped_formula_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+scopes:
+  invoices/:
+    fields:
+      total:
+        field_type: formula
+        formula: price * quantity
+        result_type: number
+"#;
+        std::fs::write(dir.path().join(".markdownvdb.schema.yml"), yaml).unwrap();
+        let overlay = Schema::load_overlay(dir.path()).unwrap().unwrap();
+        let resolved = Schema::resolve_overlay_for_path(&overlay, Some("invoices/"));
+
+        // A colliding raw field remains raw data; schema samples/counts for the
+        // formula must come from computed results instead.
+        let inferred = Schema::infer(&[make_file(serde_json::json!({
+            "price": 10,
+            "quantity": 2,
+            "total": 999
+        }))]);
+        let merged = Schema::merge(inferred, Some(resolved));
+        let total = merged.get_field("total").unwrap();
+        assert_eq!(total.field_type, FieldType::Formula);
+        assert_eq!(total.formula.as_deref(), Some("price * quantity"));
+        assert_eq!(total.result_type, Some(FormulaResultType::Number));
+        assert_eq!(total.occurrence_count, 0);
+        assert!(total.sample_values.is_empty());
+        assert_eq!(
+            serde_json::to_value(total).unwrap()["field_type"],
+            serde_json::json!("Formula")
+        );
+    }
+
+    #[test]
+    fn load_and_merge_lookup_and_rollup_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+scopes:
+  contacts:
+    fields:
+      client_domain:
+        field_type: lookup
+        relation_field: " client "
+        target_field: " domain "
+  clients:
+    fields:
+      outgoing_total:
+        field_type: rollup
+        relation_field: invoices
+        target_field: total
+        formula: values.reduce((sum, value) => sum + value, 0)
+        result_type: number
+      incoming_total:
+        field_type: rollup
+        relation_field: client
+        target_field: total
+        relation_direction: incoming
+        relation_scope: invoices/
+        formula: values.reduce((sum, value) => sum + value, 0)
+        result_type: number
+"#;
+        std::fs::write(dir.path().join(".markdownvdb.schema.yml"), yaml).unwrap();
+        let overlay = Schema::load_overlay(dir.path()).unwrap().unwrap();
+
+        let contact_overlay = Schema::resolve_overlay_for_path(&overlay, Some("contacts/a.md"));
+        let contact_inferred = Schema::infer(&[make_file(serde_json::json!({
+            "client_domain": "stale.example"
+        }))]);
+        let contacts = Schema::merge(contact_inferred, Some(contact_overlay));
+        let lookup = contacts.get_field("client_domain").unwrap();
+        assert_eq!(lookup.field_type, FieldType::Lookup);
+        assert_eq!(lookup.relation_field.as_deref(), Some("client"));
+        assert_eq!(lookup.target_field.as_deref(), Some("domain"));
+        assert_eq!(lookup.relation_direction, Some(RelationDirection::Outgoing));
+        assert_eq!(lookup.relation_scope, None);
+        assert_eq!(lookup.formula, None);
+        assert_eq!(lookup.result_type, None);
+        assert_eq!(lookup.occurrence_count, 0);
+        assert!(lookup.sample_values.is_empty());
+
+        let client_overlay = Schema::resolve_overlay_for_path(&overlay, Some("clients/a.md"));
+        let clients = Schema::merge(Schema::infer(&[]), Some(client_overlay));
+        let outgoing = clients.get_field("outgoing_total").unwrap();
+        assert_eq!(outgoing.field_type, FieldType::Rollup);
+        assert_eq!(
+            outgoing.relation_direction,
+            Some(RelationDirection::Outgoing)
+        );
+        assert_eq!(outgoing.relation_scope, None);
+        assert_eq!(outgoing.result_type, Some(FormulaResultType::Number));
+        assert!(outgoing.formula.as_deref().unwrap().contains("reduce"));
+
+        let incoming = clients.get_field("incoming_total").unwrap();
+        assert_eq!(incoming.field_type, FieldType::Rollup);
+        assert_eq!(incoming.relation_field.as_deref(), Some("client"));
+        assert_eq!(incoming.target_field.as_deref(), Some("total"));
+        assert_eq!(
+            incoming.relation_direction,
+            Some(RelationDirection::Incoming)
+        );
+        assert_eq!(incoming.relation_scope.as_deref(), Some("invoices"));
+
+        let json = serde_json::to_value(incoming).unwrap();
+        for key in [
+            "relation_field",
+            "target_field",
+            "relation_direction",
+            "relation_scope",
+            "formula",
+            "result_type",
+        ] {
+            assert!(json.as_object().unwrap().contains_key(key), "missing {key}");
+        }
+        assert_eq!(json["relation_direction"], "Incoming");
+    }
+
+    #[test]
+    fn load_overlay_rejects_invalid_formula_metadata() {
+        let invalid_overlays = [
+            (
+                "missing formula",
+                "fields:\n  total:\n    field_type: formula\n    result_type: number\n",
+            ),
+            (
+                "missing result type",
+                "fields:\n  total:\n    field_type: formula\n    formula: price * quantity\n",
+            ),
+            (
+                "invalid result type",
+                "fields:\n  total:\n    field_type: formula\n    formula: price\n    result_type: currency\n",
+            ),
+            (
+                "formula without formula type",
+                "fields:\n  total:\n    formula: price\n    result_type: number\n",
+            ),
+            (
+                "reserved field",
+                "fields:\n  title:\n    field_type: formula\n    formula: name\n    result_type: string\n",
+            ),
+            (
+                "relation target",
+                "fields:\n  total:\n    field_type: formula\n    formula: price\n    result_type: number\n    target: invoices\n",
+            ),
+            (
+                "unknown field type",
+                "fields:\n  total:\n    field_type: currency\n",
+            ),
+        ];
+
+        for (case, yaml) in invalid_overlays {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".markdownvdb.schema.yml"), yaml).unwrap();
+            assert!(
+                matches!(
+                    Schema::load_overlay(dir.path()),
+                    Err(crate::error::Error::Config(_))
+                ),
+                "{case} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn load_overlay_rejects_invalid_lookup_rollup_metadata() {
+        let invalid_overlays = [
+            (
+                "lookup missing relation",
+                "fields:\n  value:\n    field_type: lookup\n    target_field: domain\n",
+            ),
+            (
+                "lookup missing target field",
+                "fields:\n  value:\n    field_type: lookup\n    relation_field: client\n",
+            ),
+            (
+                "lookup self relation",
+                "fields:\n  client:\n    field_type: lookup\n    relation_field: client\n    target_field: domain\n",
+            ),
+            (
+                "lookup formula",
+                "fields:\n  value:\n    field_type: lookup\n    relation_field: client\n    target_field: domain\n    formula: values[0]\n",
+            ),
+            (
+                "lookup direction",
+                "fields:\n  value:\n    field_type: lookup\n    relation_field: client\n    target_field: domain\n    relation_direction: outgoing\n",
+            ),
+            (
+                "lookup scope",
+                "fields:\n  value:\n    field_type: lookup\n    relation_field: client\n    target_field: domain\n    relation_scope: clients\n",
+            ),
+            (
+                "rollup missing relation",
+                "fields:\n  total:\n    field_type: rollup\n    target_field: amount\n    formula: values.length\n    result_type: number\n",
+            ),
+            (
+                "rollup missing target field",
+                "fields:\n  total:\n    field_type: rollup\n    relation_field: invoices\n    formula: values.length\n    result_type: number\n",
+            ),
+            (
+                "rollup missing formula",
+                "fields:\n  total:\n    field_type: rollup\n    relation_field: invoices\n    target_field: amount\n    result_type: number\n",
+            ),
+            (
+                "rollup missing result type",
+                "fields:\n  total:\n    field_type: rollup\n    relation_field: invoices\n    target_field: amount\n    formula: values.length\n",
+            ),
+            (
+                "rollup bad direction",
+                "fields:\n  total:\n    field_type: rollup\n    relation_field: invoices\n    target_field: amount\n    relation_direction: sideways\n    formula: values.length\n    result_type: number\n",
+            ),
+            (
+                "incoming rollup missing scope",
+                "fields:\n  total:\n    field_type: rollup\n    relation_field: client\n    target_field: amount\n    relation_direction: incoming\n    formula: values.length\n    result_type: number\n",
+            ),
+            (
+                "incoming rollup empty scope",
+                "fields:\n  total:\n    field_type: rollup\n    relation_field: client\n    target_field: amount\n    relation_direction: incoming\n    relation_scope: ' / '\n    formula: values.length\n    result_type: number\n",
+            ),
+            (
+                "outgoing rollup scope",
+                "fields:\n  total:\n    field_type: rollup\n    relation_field: invoices\n    target_field: amount\n    relation_scope: invoices\n    formula: values.length\n    result_type: number\n",
+            ),
+            (
+                "computed relation target",
+                "fields:\n  total:\n    field_type: rollup\n    relation_field: invoices\n    target_field: amount\n    target: invoices\n    formula: values.length\n    result_type: number\n",
+            ),
+            (
+                "metadata on ordinary field",
+                "fields:\n  total:\n    field_type: number\n    relation_field: invoices\n    target_field: amount\n",
+            ),
+            (
+                "reserved lookup field",
+                "fields:\n  path:\n    field_type: lookup\n    relation_field: client\n    target_field: domain\n",
+            ),
+        ];
+
+        for (case, yaml) in invalid_overlays {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".markdownvdb.schema.yml"), yaml).unwrap();
+            assert!(
+                matches!(
+                    Schema::load_overlay(dir.path()),
+                    Err(crate::error::Error::Config(_))
+                ),
+                "{case} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_without_overlay_returns_inferred() {
+        let files = vec![make_file(serde_json::json!({"title": "Hello"}))];
+        let inferred = Schema::infer(&files);
+        let merged = Schema::merge(inferred.clone(), None);
+        assert_eq!(merged.fields.len(), 1);
+        assert_eq!(merged.fields[0].name, "title");
+    }
+
+    #[test]
+    fn merge_applies_overlay_to_existing_field() {
+        let files = vec![make_file(serde_json::json!({"title": "Hello"}))];
+        let inferred = Schema::infer(&files);
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "title".to_string(),
+            OverlayField {
+                description: Some("Doc title".to_string()),
+                field_type: None,
+                allowed_values: None,
+                required: Some(true),
+                target: None,
+                formula: None,
+                result_type: None,
+                ..OverlayField::default()
+            },
+        );
+        let merged = Schema::merge(inferred, Some(overlay));
+        assert_eq!(merged.fields[0].description.as_deref(), Some("Doc title"));
+        assert!(merged.fields[0].required);
+    }
+
+    #[test]
+    fn merge_adds_overlay_only_fields() {
+        let files = vec![make_file(serde_json::json!({"title": "Hello"}))];
+        let inferred = Schema::infer(&files);
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "category".to_string(),
+            OverlayField {
+                description: Some("Content category".to_string()),
+                field_type: Some("string".to_string()),
+                allowed_values: Some(vec!["blog".to_string(), "docs".to_string()]),
+                required: Some(false),
+                target: None,
+                formula: None,
+                result_type: None,
+                ..OverlayField::default()
+            },
+        );
+        let merged = Schema::merge(inferred, Some(overlay));
+        assert_eq!(merged.fields.len(), 2);
+        // alphabetical: category before title
+        assert_eq!(merged.fields[0].name, "category");
+        assert_eq!(merged.fields[0].occurrence_count, 0);
+        assert_eq!(merged.fields[1].name, "title");
+    }
+
+    #[test]
+    fn merge_type_override() {
+        let files = vec![make_file(serde_json::json!({"count": "42"}))];
+        let inferred = Schema::infer(&files);
+        assert_eq!(inferred.fields[0].field_type, FieldType::String);
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "count".to_string(),
+            OverlayField {
+                description: None,
+                field_type: Some("number".to_string()),
+                allowed_values: None,
+                required: None,
+                target: None,
+                formula: None,
+                result_type: None,
+                ..OverlayField::default()
+            },
+        );
+        let merged = Schema::merge(inferred, Some(overlay));
+        assert_eq!(merged.fields[0].field_type, FieldType::Number);
+    }
+
+    #[test]
+    fn get_field_found_and_not_found() {
+        let files = vec![make_file(
+            serde_json::json!({"title": "Hello", "tags": ["a"]}),
+        )];
+        let schema = Schema::infer(&files);
+        assert!(schema.get_field("title").is_some());
+        assert!(schema.get_field("nonexistent").is_none());
+    }
+
+    #[test]
+    fn field_names_returns_all() {
+        let files = vec![make_file(serde_json::json!({"b": 1, "a": 2}))];
+        let schema = Schema::infer(&files);
+        let names = schema.field_names();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    fn make_overlay(
+        fields: HashMap<String, OverlayField>,
+        scopes: HashMap<String, ScopeOverlay>,
+    ) -> OverlaySchema {
+        OverlaySchema { fields, scopes }
+    }
+
+    fn make_overlay_field(description: Option<&str>) -> OverlayField {
+        OverlayField {
+            description: description.map(|s| s.to_string()),
+            field_type: None,
+            allowed_values: None,
+            required: None,
+            target: None,
+            formula: None,
+            result_type: None,
+            ..OverlayField::default()
+        }
+    }
+
+    #[test]
+    fn resolve_no_prefix_returns_global_only() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            make_overlay_field(Some("Global title")),
+        );
+        let mut scopes = HashMap::new();
+        let mut scope_fields = HashMap::new();
+        scope_fields.insert(
+            "status".to_string(),
+            make_overlay_field(Some("Blog status")),
+        );
+        scopes.insert(
+            "blog/".to_string(),
+            ScopeOverlay {
+                fields: scope_fields,
+            },
+        );
+        let overlay = make_overlay(fields, scopes);
+
+        let resolved = Schema::resolve_overlay_for_path(&overlay, None);
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved.contains_key("title"));
+    }
+
+    #[test]
+    fn resolve_matching_scope() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            make_overlay_field(Some("Global title")),
+        );
+        let mut scopes = HashMap::new();
+        let mut scope_fields = HashMap::new();
+        scope_fields.insert(
+            "status".to_string(),
+            make_overlay_field(Some("Blog status")),
+        );
+        scopes.insert(
+            "blog/".to_string(),
+            ScopeOverlay {
+                fields: scope_fields,
+            },
+        );
+        let overlay = make_overlay(fields, scopes);
+
+        let resolved = Schema::resolve_overlay_for_path(&overlay, Some("blog/"));
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.contains_key("title"));
+        assert!(resolved.contains_key("status"));
+    }
+
+    #[test]
+    fn resolve_scope_overrides_global() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            make_overlay_field(Some("Global title")),
+        );
+        let mut scopes = HashMap::new();
+        let mut scope_fields = HashMap::new();
+        scope_fields.insert("title".to_string(), make_overlay_field(Some("Blog title")));
+        scopes.insert(
+            "blog/".to_string(),
+            ScopeOverlay {
+                fields: scope_fields,
+            },
+        );
+        let overlay = make_overlay(fields, scopes);
+
+        let resolved = Schema::resolve_overlay_for_path(&overlay, Some("blog/"));
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved["title"].description.as_deref(), Some("Blog title"));
+    }
+
+    #[test]
+    fn resolve_nested_path_matches_parent_scope() {
+        let mut scopes = HashMap::new();
+        let mut scope_fields = HashMap::new();
+        scope_fields.insert("category".to_string(), make_overlay_field(Some("Blog cat")));
+        scopes.insert(
+            "blog/".to_string(),
+            ScopeOverlay {
+                fields: scope_fields,
+            },
+        );
+        let overlay = make_overlay(HashMap::new(), scopes);
+
+        let resolved = Schema::resolve_overlay_for_path(&overlay, Some("blog/2024/post.md"));
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved.contains_key("category"));
+    }
+
+    #[test]
+    fn resolve_multiple_scopes_union() {
+        let mut scopes = HashMap::new();
+        let mut blog_fields = HashMap::new();
+        blog_fields.insert("category".to_string(), make_overlay_field(Some("Blog cat")));
+        scopes.insert(
+            "blog/".to_string(),
+            ScopeOverlay {
+                fields: blog_fields,
+            },
+        );
+        let mut nested_fields = HashMap::new();
+        nested_fields.insert("year".to_string(), make_overlay_field(Some("Year")));
+        scopes.insert(
+            "blog/2024/".to_string(),
+            ScopeOverlay {
+                fields: nested_fields,
+            },
+        );
+        let overlay = make_overlay(HashMap::new(), scopes);
+
+        let resolved = Schema::resolve_overlay_for_path(&overlay, Some("blog/2024/post.md"));
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.contains_key("category"));
+        assert!(resolved.contains_key("year"));
+    }
+
+    #[test]
+    fn resolve_no_matching_scope() {
+        let mut fields = HashMap::new();
+        fields.insert("title".to_string(), make_overlay_field(Some("Global")));
+        let mut scopes = HashMap::new();
+        let mut scope_fields = HashMap::new();
+        scope_fields.insert("status".to_string(), make_overlay_field(None));
+        scopes.insert(
+            "blog/".to_string(),
+            ScopeOverlay {
+                fields: scope_fields,
+            },
+        );
+        let overlay = make_overlay(fields, scopes);
+
+        let resolved = Schema::resolve_overlay_for_path(&overlay, Some("docs/readme.md"));
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved.contains_key("title"));
+    }
+
+    #[test]
+    fn resolve_scope_requires_a_path_segment_boundary() {
+        let mut scopes = HashMap::new();
+        let mut scope_fields = HashMap::new();
+        scope_fields.insert("total".to_string(), make_overlay_field(None));
+        scopes.insert(
+            "invoices".to_string(),
+            ScopeOverlay {
+                fields: scope_fields,
+            },
+        );
+        let overlay = make_overlay(HashMap::new(), scopes);
+
+        assert!(
+            Schema::resolve_overlay_for_path(&overlay, Some("invoices/a.md")).contains_key("total")
+        );
+        assert!(
+            !Schema::resolve_overlay_for_path(&overlay, Some("invoices-old/a.md"))
+                .contains_key("total")
+        );
+    }
+
+    #[test]
+    fn load_overlay_with_scopes_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+fields:
+  title:
+    description: "Document title"
+    required: true
+scopes:
+  blog/:
+    fields:
+      status:
+        description: "Publication status"
+        allowed_values: ["draft", "published"]
+"#;
+        std::fs::write(dir.path().join(".markdownvdb.schema.yml"), yaml).unwrap();
+        let result = Schema::load_overlay(dir.path()).unwrap().unwrap();
+        assert_eq!(result.fields.len(), 1);
+        assert_eq!(result.scopes.len(), 1);
+        assert!(result.scopes.contains_key("blog/"));
+        assert_eq!(result.scopes["blog/"].fields.len(), 1);
+    }
+
+    #[test]
+    fn load_overlay_backward_compat() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+fields:
+  title:
+    description: "Document title"
+"#;
+        std::fs::write(dir.path().join(".markdownvdb.schema.yml"), yaml).unwrap();
+        let result = Schema::load_overlay(dir.path()).unwrap().unwrap();
+        assert_eq!(result.fields.len(), 1);
+        assert!(result.scopes.is_empty());
+    }
+
+    fn make_file_with_path(path: &str, frontmatter: serde_json::Value) -> MarkdownFile {
+        MarkdownFile {
+            path: std::path::PathBuf::from(path),
+            frontmatter: Some(frontmatter),
+            headings: vec![],
+            body: String::new(),
+            content_hash: String::new(),
+            file_size: 0,
+            links: Vec::new(),
+            modified_at: 0,
+            frontmatter_links: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn infer_from_iter_matches_infer() {
+        let files = vec![
+            make_file(serde_json::json!({"title": "Hello", "count": 5})),
+            make_file(serde_json::json!({"title": "World", "tags": ["a"]})),
+        ];
+        let schema_infer = Schema::infer(&files);
+        let schema_iter = Schema::infer_from_iter(files.iter());
+        assert_eq!(schema_infer.fields.len(), schema_iter.fields.len());
+        for (a, b) in schema_infer.fields.iter().zip(schema_iter.fields.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.field_type, b.field_type);
+            assert_eq!(a.occurrence_count, b.occurrence_count);
+        }
+    }
+
+    #[test]
+    fn infer_scoped_filters_by_prefix() {
+        let files = vec![
+            make_file_with_path(
+                "blog/post1.md",
+                serde_json::json!({"title": "Post", "status": "draft"}),
+            ),
+            make_file_with_path(
+                "blog/post2.md",
+                serde_json::json!({"title": "Post2", "status": "published"}),
+            ),
+            make_file_with_path(
+                "docs/readme.md",
+                serde_json::json!({"title": "Docs", "version": "1.0"}),
+            ),
+        ];
+        let schema = Schema::infer_scoped(&files, "blog");
+        assert_eq!(schema.fields.len(), 2); // status, title
+        assert_eq!(schema.fields[0].name, "status");
+        assert_eq!(schema.fields[1].name, "title");
+        assert_eq!(schema.fields[1].occurrence_count, 2);
+    }
+
+    #[test]
+    fn infer_scoped_empty_prefix_returns_empty() {
+        let files = vec![make_file_with_path(
+            "blog/post.md",
+            serde_json::json!({"title": "Post"}),
+        )];
+        // Empty prefix matches nothing since paths don't start with ""... actually they do
+        let schema = Schema::infer_scoped(&files, "");
+        assert_eq!(schema.fields.len(), 1);
+    }
+
+    #[test]
+    fn infer_scoped_no_matches() {
+        let files = vec![make_file_with_path(
+            "blog/post.md",
+            serde_json::json!({"title": "Post"}),
+        )];
+        let schema = Schema::infer_scoped(&files, "docs");
+        assert!(schema.fields.is_empty());
+    }
+
+    #[test]
+    fn infer_scoped_with_trailing_slash() {
+        let files = vec![make_file_with_path(
+            "blog/post.md",
+            serde_json::json!({"title": "Post"}),
+        )];
+        let schema = Schema::infer_scoped(&files, "blog/");
+        assert_eq!(schema.fields.len(), 1);
+    }
+
+    #[test]
+    fn discover_scopes_extracts_top_level_dirs() {
+        let files = vec![
+            make_file_with_path("blog/post1.md", serde_json::json!({})),
+            make_file_with_path("blog/post2.md", serde_json::json!({})),
+            make_file_with_path("docs/readme.md", serde_json::json!({})),
+            make_file_with_path("notes/daily/today.md", serde_json::json!({})),
+            make_file_with_path("root-file.md", serde_json::json!({})),
+        ];
+        let scopes = Schema::discover_scopes(&files);
+        assert_eq!(scopes, vec!["blog", "docs", "notes"]);
+    }
+
+    #[test]
+    fn discover_scopes_empty_files() {
+        let scopes = Schema::discover_scopes(&[]);
+        assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn discover_scopes_no_directories() {
+        let files = vec![
+            make_file_with_path("file1.md", serde_json::json!({})),
+            make_file_with_path("file2.md", serde_json::json!({})),
+        ];
+        let scopes = Schema::discover_scopes(&files);
+        assert!(scopes.is_empty());
+    }
+
+    // --- relation typing (phase 31) ---
+
+    #[test]
+    fn infer_field_type_relation_values() {
+        assert_eq!(
+            infer_field_type(&serde_json::json!("[[clients/acme]]")),
+            FieldType::Relation
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!("[Acme](clients/acme.md)")),
+            FieldType::Relation
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!("clients/acme.md")),
+            FieldType::Relation
+        );
+        // All-document-link list → Relation; plain `.md` filenames are the
+        // preferred authoring form, while wiki links remain supported.
+        assert_eq!(
+            infer_field_type(&serde_json::json!(["a.md", "b.md"])),
+            FieldType::Relation
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!(["[[a]]", "plain"])),
+            FieldType::List
+        );
+        assert_eq!(infer_field_type(&serde_json::json!([])), FieldType::List);
+        // Embedded links are plain strings.
+        assert_eq!(
+            infer_field_type(&serde_json::json!("See [[x]] for details")),
+            FieldType::String
+        );
+    }
+
+    #[test]
+    fn infer_field_type_file_values() {
+        assert_eq!(
+            infer_field_type(&serde_json::json!("[[assets/mockup.png]]")),
+            FieldType::File
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!("[Spec](documents/spec.pdf)")),
+            FieldType::File
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!([
+                "[[assets/mockup.png]]",
+                "[[documents/spec.pdf]]"
+            ])),
+            FieldType::File
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!([
+                "[[assets/mockup.png]]",
+                "[[clients/acme]]"
+            ])),
+            FieldType::Mixed
+        );
+        // Plain dotted strings are not automatically treated as files.
+        assert_eq!(
+            infer_field_type(&serde_json::json!("release-1.2.3")),
+            FieldType::String
+        );
+    }
+
+    #[test]
+    fn overlay_pins_file_and_ignores_relation_target() {
+        let inferred = Schema::infer(&[make_file(serde_json::json!({
+            "attachments": []
+        }))]);
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "attachments".to_string(),
+            OverlayField {
+                description: None,
+                field_type: Some("file".to_string()),
+                allowed_values: None,
+                required: None,
+                target: Some("assets".to_string()),
+                formula: None,
+                result_type: None,
+                ..OverlayField::default()
+            },
+        );
+        let merged = Schema::merge(inferred, Some(overlay));
+        assert_eq!(merged.fields[0].field_type, FieldType::File);
+        assert_eq!(merged.fields[0].relation_target, None);
+        assert_eq!(serde_json::to_string(&FieldType::File).unwrap(), "\"File\"");
+    }
+
+    #[test]
+    fn reclassifies_legacy_relation_samples_as_files() {
+        let mut schema = Schema::infer(&[make_file(serde_json::json!({
+            "attachments": [
+                "[[assets/mockup.png]]",
+                "[[documents/spec.pdf]]"
+            ]
+        }))]);
+        schema.fields[0].field_type = FieldType::Relation;
+
+        let migrated = schema.reclassify_legacy_file_fields();
+
+        assert_eq!(migrated.fields[0].field_type, FieldType::File);
+        assert_eq!(migrated.fields[0].relation_target, None);
+    }
+
+    #[test]
+    fn explicit_relation_overlay_wins_after_legacy_file_reclassification() {
+        let mut schema = Schema::infer(&[make_file(serde_json::json!({
+            "attachments": ["[[assets/mockup.png]]"]
+        }))]);
+        schema.fields[0].field_type = FieldType::Relation;
+        let migrated = schema.reclassify_legacy_file_fields();
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "attachments".to_string(),
+            OverlayField {
+                description: None,
+                field_type: Some("relation".to_string()),
+                allowed_values: None,
+                required: None,
+                target: Some("documents".to_string()),
+                formula: None,
+                result_type: None,
+                ..OverlayField::default()
+            },
+        );
+
+        let merged = Schema::merge(migrated, Some(overlay));
+
+        assert_eq!(merged.fields[0].field_type, FieldType::Relation);
+        assert_eq!(
+            merged.fields[0].relation_target.as_deref(),
+            Some("documents")
+        );
+    }
+
+    #[test]
+    fn infer_relation_field_all_links() {
+        let files = vec![
+            make_file(serde_json::json!({"client": "[[clients/acme]]"})),
+            make_file(serde_json::json!({"client": "[[clients/globex|Globex]]"})),
+        ];
+        let schema = Schema::infer(&files);
+        assert_eq!(schema.fields[0].field_type, FieldType::Relation);
+        assert_eq!(schema.fields[0].relation_target, None);
+    }
+
+    #[test]
+    fn infer_relation_field_mixed_values_becomes_mixed() {
+        let files = vec![
+            make_file(serde_json::json!({"client": "[[clients/acme]]"})),
+            make_file(serde_json::json!({"client": "just text"})),
+        ];
+        let schema = Schema::infer(&files);
+        assert_eq!(schema.fields[0].field_type, FieldType::Mixed);
+    }
+
+    #[test]
+    fn infer_relation_lists() {
+        let files = vec![
+            make_file(serde_json::json!({"clients": ["[[a]]", "[[b]]"]})),
+            make_file(serde_json::json!({"clients": ["[[c]]"]})),
+        ];
+        let schema = Schema::infer(&files);
+        assert_eq!(schema.fields[0].field_type, FieldType::Relation);
+    }
+
+    #[test]
+    fn infer_relation_broken_by_empty_array() {
+        let files = vec![
+            make_file(serde_json::json!({"clients": ["[[a]]"]})),
+            make_file(serde_json::json!({"clients": []})),
+        ];
+        let schema = Schema::infer(&files);
+        // Relation + List discriminants → Mixed.
+        assert_eq!(schema.fields[0].field_type, FieldType::Mixed);
+    }
+
+    #[test]
+    fn parse_field_type_str_relation() {
+        assert_eq!(parse_field_type_str("relation"), Some(FieldType::Relation));
+        assert_eq!(parse_field_type_str("Relation"), Some(FieldType::Relation));
+        assert_eq!(parse_field_type_str("file"), Some(FieldType::File));
+        assert_eq!(parse_field_type_str("File"), Some(FieldType::File));
+    }
+
+    #[test]
+    fn field_type_relation_serializes_pascal_case() {
+        assert_eq!(
+            serde_json::to_string(&FieldType::Relation).unwrap(),
+            "\"Relation\""
+        );
+    }
+
+    #[test]
+    fn merge_overlay_relation_with_target() {
+        let files = vec![make_file(serde_json::json!({"client": "some string"}))];
+        let inferred = Schema::infer(&files);
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "client".to_string(),
+            OverlayField {
+                description: None,
+                field_type: Some("relation".to_string()),
+                allowed_values: None,
+                required: None,
+                target: Some("clients/".to_string()),
+                formula: None,
+                result_type: None,
+                ..OverlayField::default()
+            },
+        );
+        let merged = Schema::merge(inferred, Some(overlay));
+        assert_eq!(merged.fields[0].field_type, FieldType::Relation);
+        // Trailing slash normalized away.
+        assert_eq!(merged.fields[0].relation_target.as_deref(), Some("clients"));
+    }
+
+    #[test]
+    fn merge_target_implies_relation() {
+        let files = vec![make_file(serde_json::json!({"client": "acme"}))];
+        let inferred = Schema::infer(&files);
+        assert_eq!(inferred.fields[0].field_type, FieldType::String);
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "client".to_string(),
+            OverlayField {
+                description: None,
+                field_type: None,
+                allowed_values: None,
+                required: None,
+                target: Some("clients".to_string()),
+                formula: None,
+                result_type: None,
+                ..OverlayField::default()
+            },
+        );
+        let merged = Schema::merge(inferred, Some(overlay));
+        assert_eq!(merged.fields[0].field_type, FieldType::Relation);
+        assert_eq!(merged.fields[0].relation_target.as_deref(), Some("clients"));
+    }
+
+    #[test]
+    fn merge_overlay_only_field_with_target() {
+        let inferred = Schema::infer(&[]);
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "client".to_string(),
+            OverlayField {
+                description: None,
+                field_type: None,
+                allowed_values: None,
+                required: None,
+                target: Some("clients".to_string()),
+                formula: None,
+                result_type: None,
+                ..OverlayField::default()
+            },
+        );
+        let merged = Schema::merge(inferred, Some(overlay));
+        assert_eq!(merged.fields[0].field_type, FieldType::Relation);
+        assert_eq!(merged.fields[0].relation_target.as_deref(), Some("clients"));
+        assert_eq!(merged.fields[0].occurrence_count, 0);
+    }
+
+    #[test]
+    fn load_overlay_accepts_type_alias_and_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+fields:
+  client:
+    type: relation
+    target: clients/
+"#;
+        std::fs::write(dir.path().join(".markdownvdb.schema.yml"), yaml).unwrap();
+        let overlay = Schema::load_overlay(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            overlay.fields["client"].field_type.as_deref(),
+            Some("relation")
+        );
+        assert_eq!(overlay.fields["client"].target.as_deref(), Some("clients/"));
+
+        // And through merge, the alias behaves exactly like field_type:.
+        let merged = Schema::merge(
+            Schema::infer(&[]),
+            Some(Schema::resolve_overlay_for_path(&overlay, None)),
+        );
+        assert_eq!(merged.fields[0].field_type, FieldType::Relation);
+        assert_eq!(merged.fields[0].relation_target.as_deref(), Some("clients"));
+    }
+
+    #[test]
+    fn schema_field_relation_target_serializes_null_when_absent() {
+        let files = vec![make_file(serde_json::json!({"title": "Hello"}))];
+        let schema = Schema::infer(&files);
+        let json = serde_json::to_value(&schema.fields[0]).unwrap();
+        assert!(json.as_object().unwrap().contains_key("relation_target"));
+        assert!(json["relation_target"].is_null());
+    }
+}

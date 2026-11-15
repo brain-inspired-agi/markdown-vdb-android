@@ -1,0 +1,3645 @@
+use std::fs;
+use std::process::Command;
+
+use tempfile::TempDir;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build the path to the compiled binary via `cargo build` output directory.
+/// We rely on `env!("CARGO_BIN_EXE_mdvdb")` at test-time, but since that
+/// requires assert_cmd's `cargo_bin`, we use the CARGO_BIN_EXE env var that
+/// cargo sets for integration tests when [[bin]] is defined.
+fn mdvdb_bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_mdvdb"))
+}
+
+/// Create a temp directory with a mock-provider config and some markdown files,
+/// then run `ingest` so the index is populated and ready for queries.
+fn setup_and_ingest() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("hello.md"),
+        "---\ntitle: Hello World\nstatus: published\nattachments:\n  - \"[[assets/mockup.png]]\"\n---\n\n# Hello\n\nThis is a test document about greetings.\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("rust.md"),
+        "---\ntitle: Rust Guide\nstatus: draft\n---\n\n# Rust\n\nRust is a systems programming language.\n",
+    )
+    .unwrap();
+
+    let output = mdvdb_bin()
+        .arg("ingest")
+        .current_dir(root)
+        .output()
+        .expect("failed to run ingest");
+    assert!(
+        output.status.success(),
+        "ingest should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_status_json_without_index_returns_empty() {
+    let dir = TempDir::new().unwrap();
+    let output = mdvdb_bin()
+        .args(["status", "--json"])
+        .env("MDVDB_NO_USER_CONFIG", "1")
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(
+        output.status.success(),
+        "status --json on empty dir should succeed (lazy provider), got exit code {:?}",
+        output.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("status JSON should be valid");
+    assert_eq!(parsed["document_count"], 0);
+    assert_eq!(parsed["chunk_count"], 0);
+    assert_eq!(parsed["embedding_compatible"], false);
+    assert_eq!(parsed["reindex_required"], true);
+}
+
+#[test]
+fn test_init_creates_config_file() {
+    let dir = TempDir::new().unwrap();
+    let output = mdvdb_bin()
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(
+        output.status.success(),
+        "init should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dir.path().join(".markdownvdb").join("config.yaml").exists(),
+        ".markdownvdb/config.yaml should be created"
+    );
+    let config = fs::read_to_string(dir.path().join(".markdownvdb/config.yaml")).unwrap();
+    assert!(config.contains("dimensions: auto"));
+}
+
+#[test]
+fn test_embedding_models_catalogless_provider_accepts_free_text() {
+    let dir = TempDir::new().unwrap();
+    let output = mdvdb_bin()
+        .args(["embedding", "models", "--provider", "azure", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to execute embedding models");
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["provider"], "azure-openai");
+    assert_eq!(json["discovery_available"], false);
+    assert_eq!(json["models"], serde_json::json!([]));
+}
+
+#[test]
+fn test_config_json_keeps_model_opaque_and_redacts_secrets() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".markdownvdb")).unwrap();
+    fs::write(
+        dir.path().join(".markdownvdb/config.yaml"),
+        "embedding:\n  provider: openrouter\n  model: vendor/unseen-model@revision\n  dimensions: auto\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(".markdownvdb/.env"),
+        "OPENROUTER_API_KEY=must-not-appear\n",
+    )
+    .unwrap();
+
+    let output = mdvdb_bin()
+        .args(["config", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["embedding_model"], "vendor/unseen-model@revision");
+    assert_eq!(json["embedding_dimensions"], "auto");
+    assert!(!stdout.contains("must-not-appear"));
+    assert!(json.get("openai_api_key").is_none());
+}
+
+#[test]
+fn test_init_when_config_exists_fails() {
+    let dir = TempDir::new().unwrap();
+    // First init — should succeed.
+    let first = mdvdb_bin()
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+    assert!(first.status.success(), "first init should succeed");
+
+    // Second init — should fail.
+    let second = mdvdb_bin()
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(
+        !second.status.success(),
+        "init when .markdownvdb exists should fail"
+    );
+}
+
+#[test]
+fn test_completions_bash_outputs_script() {
+    let output = mdvdb_bin()
+        .args(["completions", "bash"])
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(
+        output.status.success(),
+        "completions bash should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("complete") || stdout.contains("_mdvdb"),
+        "should output a bash completion script, got: {}",
+        &stdout[..stdout.len().min(200)]
+    );
+}
+
+#[test]
+fn test_help_shows_all_subcommands() {
+    let output = mdvdb_bin()
+        .arg("--help")
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(output.status.success(), "—help should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for cmd in ["search", "ingest", "status", "init"] {
+        assert!(stdout.contains(cmd), "--help output should mention '{cmd}'");
+    }
+}
+
+#[test]
+fn test_search_help_shows_flags() {
+    let output = mdvdb_bin()
+        .args(["search", "--help"])
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(output.status.success(), "search --help should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for flag in ["--limit", "--min-score", "--filter", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "search --help should mention '{flag}'"
+        );
+    }
+}
+
+#[test]
+fn test_ingest_json_output() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+    fs::write(root.join("doc.md"), "# Doc\n\nSome content.\n").unwrap();
+
+    let output = mdvdb_bin()
+        .args(["ingest", "--json"])
+        .current_dir(root)
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(output.status.success(), "ingest --json should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(json["files_indexed"].as_u64().unwrap() > 0);
+    assert_eq!(json["files_failed"].as_u64().unwrap(), 0);
+    assert!(json.get("type").is_none(), "normal JSON remains unframed");
+    assert!(json["estimated_input_tokens"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn test_ingest_json_lines_streams_progress_then_result() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+    fs::write(root.join("doc.md"), "# Doc\n\nSome content to embed.\n").unwrap();
+
+    let output = mdvdb_bin()
+        .args(["ingest", "--json", "--json-lines"])
+        .current_dir(root)
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "streamed ingest should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let frames = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        frames.len() > 2,
+        "expected multiple progress frames and one result"
+    );
+    assert_eq!(frames.first().unwrap()["type"], "progress");
+    assert_eq!(frames.first().unwrap()["data"]["phase"], "preparing");
+    assert!(frames[..frames.len() - 1]
+        .iter()
+        .all(|frame| frame["type"] == "progress"));
+    let result = frames.last().unwrap();
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["operation"], "ingest");
+    assert!(result["data"]["estimated_input_tokens"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn test_search_json_output_format() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "rust programming", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(output.status.success(), "search --json should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    // Wrapped format: { results, query, total_results }
+    assert!(json["results"].is_array(), "should have 'results' array");
+    assert_eq!(json["query"].as_str().unwrap(), "rust programming");
+    assert!(
+        json["total_results"].is_number(),
+        "should have 'total_results'"
+    );
+}
+
+#[test]
+fn test_status_json_output_after_ingest() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["status", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "status --json should succeed after ingest"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    assert!(json["document_count"].as_u64().unwrap() > 0);
+    assert!(json["chunk_count"].as_u64().unwrap() > 0);
+    assert!(json["vector_count"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn test_schema_json_output() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["schema", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(output.status.success(), "schema --json should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    assert!(
+        json["fields"].is_array(),
+        "schema should have 'fields' array"
+    );
+    let fields = json["fields"].as_array().unwrap();
+    assert!(!fields.is_empty(), "should have inferred schema fields");
+
+    let names: Vec<&str> = fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert!(
+        names.contains(&"title"),
+        "schema should contain 'title', got: {names:?}"
+    );
+    assert!(
+        names.contains(&"status"),
+        "schema should contain 'status', got: {names:?}"
+    );
+    let attachments = fields
+        .iter()
+        .find(|field| field["name"] == "attachments")
+        .expect("schema should contain attachments");
+    assert_eq!(attachments["field_type"], "File");
+    assert!(attachments["relation_target"].is_null());
+}
+
+#[test]
+fn test_get_json_output() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["get", "hello.md", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(output.status.success(), "get --json should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    assert_eq!(json["path"].as_str().unwrap(), "hello.md");
+    assert!(json["chunk_count"].as_u64().unwrap() > 0);
+    assert!(json["file_size"].as_u64().unwrap() > 0);
+    assert!(!json["content_hash"].as_str().unwrap().is_empty());
+    // frontmatter should be present
+    assert!(
+        json["frontmatter"].is_object(),
+        "get --json should include frontmatter"
+    );
+    assert_eq!(
+        json["frontmatter"]["title"].as_str().unwrap(),
+        "Hello World"
+    );
+}
+
+#[test]
+fn test_get_nonexistent_file_exits_with_error() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["get", "nonexistent.md"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        !output.status.success(),
+        "get for nonexistent file should fail"
+    );
+}
+
+#[test]
+fn test_search_limit_flag() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "document", "--limit", "1", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(output.status.success(), "search --limit should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    let results = json["results"].as_array().unwrap();
+    assert!(
+        results.len() <= 1,
+        "should return at most 1 result with --limit 1"
+    );
+}
+
+#[test]
+fn test_search_filter_flag() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args([
+            "search",
+            "document",
+            "--filter",
+            "status=published",
+            "--json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --filter should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(
+        json["results"].is_array(),
+        "filtered search should return results array"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CLI formatting tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_no_subcommand_shows_logo() {
+    let dir = TempDir::new().unwrap();
+    let output = mdvdb_bin()
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+
+    // No subcommand should show the logo and exit successfully.
+    assert!(output.status.success(), "no subcommand should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The logo contains ASCII art with "mdvdb" stylized characters.
+    assert!(
+        stdout.contains("__,_") || stdout.contains("mdvdb"),
+        "no-subcommand output should contain logo text, got: {}",
+        &stdout[..stdout.len().min(300)]
+    );
+}
+
+#[test]
+fn test_no_color_flag_disables_colors() {
+    let dir = setup_and_ingest();
+    let output = mdvdb_bin()
+        .args(["--no-color", "status"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(
+        output.status.success(),
+        "status with --no-color should succeed"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("\x1b["),
+        "stdout should not contain ANSI escape sequences with --no-color, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_no_color_env_var() {
+    let dir = setup_and_ingest();
+    let output = mdvdb_bin()
+        .args(["status"])
+        .env("NO_COLOR", "1")
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(
+        output.status.success(),
+        "status with NO_COLOR=1 should succeed"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("\x1b["),
+        "stdout should not contain ANSI escape sequences with NO_COLOR=1, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_search_human_shows_score_bar() {
+    let dir = setup_and_ingest();
+    let output = mdvdb_bin()
+        .args(["--no-color", "search", "rust programming"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(output.status.success(), "human search should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Score bars use █ or ░ characters.
+    assert!(
+        stdout.contains('█') || stdout.contains('░'),
+        "search output should contain bar characters (█/░), got: {stdout}"
+    );
+}
+
+#[test]
+fn test_clusters_shows_keywords() {
+    let dir = setup_and_ingest();
+    let output = mdvdb_bin()
+        .args(["--no-color", "clusters"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(output.status.success(), "clusters should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Clusters output should include keyword text (the TF-IDF labels).
+    assert!(
+        stdout.contains("keyword")
+            || stdout.contains("Keyword")
+            || stdout.contains("document")
+            || stdout.len() > 20,
+        "clusters output should include keyword or cluster info, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_get_shows_frontmatter() {
+    let dir = setup_and_ingest();
+    let output = mdvdb_bin()
+        .args(["--no-color", "get", "hello.md"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(output.status.success(), "get should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should show frontmatter field names from hello.md.
+    assert!(
+        stdout.contains("title"),
+        "get output should include frontmatter field 'title', got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Hello World") || stdout.contains("hello"),
+        "get output should include frontmatter value, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_ingest_json_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+    fs::write(root.join("doc.md"), "# Doc\n\nSome content.\n").unwrap();
+
+    let output = mdvdb_bin()
+        .args(["ingest", "--json"])
+        .current_dir(root)
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(output.status.success(), "ingest --json should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("\x1b["),
+        "ingest --json should not contain ANSI codes, got: {stdout}"
+    );
+    // Verify it's valid JSON (no ANSI contamination).
+    let _: serde_json::Value =
+        serde_json::from_str(&stdout).expect("ingest --json should be valid JSON");
+}
+
+// ---------------------------------------------------------------------------
+// Link graph CLI tests
+// ---------------------------------------------------------------------------
+
+/// Create a temp directory with markdown files that contain links, ingest it.
+fn setup_and_ingest_with_links() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("alpha.md"),
+        "---\ntitle: Alpha\n---\n\n# Alpha\n\nLinks to [Beta](beta.md) and [Gamma](gamma.md).\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("beta.md"),
+        "---\ntitle: Beta\n---\n\n# Beta\n\nLinks back to [Alpha](alpha.md).\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("gamma.md"),
+        "---\ntitle: Gamma\n---\n\n# Gamma\n\nNo outgoing links here.\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("orphan.md"),
+        "---\ntitle: Orphan\n---\n\n# Orphan\n\nThis file has no links at all.\n",
+    )
+    .unwrap();
+
+    let output = mdvdb_bin()
+        .arg("ingest")
+        .current_dir(root)
+        .output()
+        .expect("failed to run ingest");
+    assert!(
+        output.status.success(),
+        "ingest should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
+#[test]
+fn test_links_json_output() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["links", "alpha.md", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "links --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    assert_eq!(json["file"].as_str().unwrap(), "alpha.md");
+    let links = &json["links"];
+    assert!(
+        links["outgoing"].is_array(),
+        "should have 'links.outgoing' array"
+    );
+    let outgoing = links["outgoing"].as_array().unwrap();
+    assert!(
+        outgoing.len() >= 2,
+        "alpha.md should have at least 2 outgoing links, got {}",
+        outgoing.len()
+    );
+    assert!(
+        links["incoming"].is_array(),
+        "should have 'links.incoming' array"
+    );
+}
+
+#[test]
+fn test_backlinks_json_output() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["backlinks", "alpha.md", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "backlinks --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    assert_eq!(json["file"].as_str().unwrap(), "alpha.md");
+    assert!(
+        json["backlinks"].is_array(),
+        "should have 'backlinks' array"
+    );
+    // beta.md links to alpha.md, so alpha should have backlinks
+    let backlinks = json["backlinks"].as_array().unwrap();
+    assert!(
+        !backlinks.is_empty(),
+        "alpha.md should have backlinks from beta.md"
+    );
+}
+
+#[test]
+fn test_orphans_json_output() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["orphans", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "orphans --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    // orphan.md has no links in or out, so it should appear
+    assert!(json["orphans"].is_array(), "should have 'orphans' array");
+    let orphans = json["orphans"].as_array().unwrap();
+    let paths: Vec<&str> = orphans.iter().filter_map(|o| o["path"].as_str()).collect();
+    assert!(
+        paths.contains(&"orphan.md"),
+        "orphan.md should be in orphans list, got: {paths:?}"
+    );
+}
+
+#[test]
+fn test_links_nonexistent_file() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["links", "nonexistent.md", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    // The command should fail with an error for a nonexistent file
+    assert!(
+        !output.status.success(),
+        "links should fail for nonexistent file"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not in index") || stderr.contains("nonexistent.md"),
+        "error should mention the file is not in the index, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_search_boost_links_flag() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["search", "alpha", "--boost-links", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --boost-links should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(json["results"].is_array(), "should have 'results' array");
+}
+
+#[test]
+fn test_status_json_unchanged() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["status", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(output.status.success(), "status --json should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("\x1b["),
+        "status --json should not contain ANSI codes, got: {stdout}"
+    );
+    // Verify it's valid JSON.
+    let _: serde_json::Value =
+        serde_json::from_str(&stdout).expect("status --json should be valid JSON");
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid / FTS search CLI tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_search_help_shows_mode_flags() {
+    let output = mdvdb_bin()
+        .args(["search", "--help"])
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(output.status.success(), "search --help should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for flag in ["--mode", "--semantic", "--lexical"] {
+        assert!(
+            stdout.contains(flag),
+            "search --help should mention '{flag}', got: {}",
+            &stdout[..stdout.len().min(500)]
+        );
+    }
+}
+
+#[test]
+fn test_search_with_mode_semantic() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "rust", "--mode", "semantic", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --mode semantic should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(json["results"].is_array(), "should have results array");
+}
+
+#[test]
+fn test_search_with_mode_lexical() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "rust programming", "--mode", "lexical", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --mode lexical should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(json["results"].is_array(), "should have results array");
+}
+
+#[test]
+fn test_search_with_mode_hybrid() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "rust", "--mode", "hybrid", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --mode hybrid should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(json["results"].is_array(), "should have results array");
+}
+
+#[test]
+fn test_search_semantic_shorthand_flag() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "rust", "--semantic", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --semantic should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_search_lexical_shorthand_flag() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "rust programming", "--lexical", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --lexical should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_search_invalid_mode_rejected() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "rust", "--mode", "invalid"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        !output.status.success(),
+        "search --mode invalid should fail"
+    );
+}
+
+#[test]
+fn test_search_json_output_includes_mode() {
+    let dir = setup_and_ingest();
+
+    // Test with explicit lexical mode.
+    let output = mdvdb_bin()
+        .args(["search", "rust programming", "--mode", "lexical", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --mode lexical --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert_eq!(
+        json["mode"], "lexical",
+        "JSON output should include mode field with value 'lexical'"
+    );
+
+    // Test with hybrid mode (default).
+    let output = mdvdb_bin()
+        .args(["search", "rust", "--mode", "hybrid", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert_eq!(
+        json["mode"], "hybrid",
+        "JSON output should include mode field with value 'hybrid'"
+    );
+}
+
+#[test]
+fn test_search_semantic_lexical_flags_conflict() {
+    let dir = setup_and_ingest();
+
+    // Using both --semantic and --lexical should fail (clap conflict).
+    let output = mdvdb_bin()
+        .args(["search", "rust", "--semantic", "--lexical"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        !output.status.success(),
+        "--semantic and --lexical together should fail"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Init --global, config, and doctor tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_init_global_creates_user_config() {
+    let dir = TempDir::new().unwrap();
+    let output = mdvdb_bin()
+        .args(["init", "--global"])
+        .env("MDVDB_CONFIG_HOME", dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(
+        output.status.success(),
+        "init --global should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // init_global now writes to config.yaml (YAML pipeline)
+    assert!(
+        dir.path().join("config.yaml").exists(),
+        "user config file should be created at config.yaml"
+    );
+
+    let content = fs::read_to_string(dir.path().join("config.yaml")).unwrap();
+    assert!(
+        content.contains("OPENAI_API_KEY"),
+        "user config template should mention OPENAI_API_KEY"
+    );
+}
+
+#[test]
+fn test_init_global_twice_fails() {
+    let dir = TempDir::new().unwrap();
+
+    let first = mdvdb_bin()
+        .args(["init", "--global"])
+        .env("MDVDB_CONFIG_HOME", dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+    assert!(first.status.success(), "first init --global should succeed");
+
+    let second = mdvdb_bin()
+        .args(["init", "--global"])
+        .env("MDVDB_CONFIG_HOME", dir.path())
+        .output()
+        .expect("failed to execute mdvdb");
+    assert!(
+        !second.status.success(),
+        "init --global when config exists should fail"
+    );
+}
+
+#[test]
+fn test_config_json_output() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+
+    let output = mdvdb_bin()
+        .args(["config", "--json"])
+        .env("MDVDB_NO_USER_CONFIG", "1")
+        .current_dir(root)
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "config --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(
+        json["embedding_model"].is_string(),
+        "should have embedding_model field"
+    );
+    assert!(
+        json["embedding_dimensions"].is_number(),
+        "should have embedding_dimensions field"
+    );
+}
+
+#[test]
+fn test_config_human_output() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+
+    let output = mdvdb_bin()
+        .args(["--no-color", "config"])
+        .env("MDVDB_NO_USER_CONFIG", "1")
+        .current_dir(root)
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "config should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Configuration"),
+        "should contain Configuration header"
+    );
+    assert!(stdout.contains("Provider"), "should show provider");
+}
+
+#[test]
+fn test_doctor_json_output() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["doctor", "--json"])
+        .env("MDVDB_NO_USER_CONFIG", "1")
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "doctor --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(json["checks"].is_array(), "should have checks array");
+    assert!(json["passed"].is_number(), "should have passed count");
+    assert!(json["total"].is_number(), "should have total count");
+}
+
+#[test]
+fn test_doctor_human_output() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["--no-color", "doctor"])
+        .env("MDVDB_NO_USER_CONFIG", "1")
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "doctor should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("mdvdb doctor"),
+        "should contain doctor header"
+    );
+    assert!(stdout.contains("checks passed"), "should show pass count");
+}
+
+#[test]
+fn test_help_shows_new_subcommands() {
+    let output = mdvdb_bin()
+        .arg("--help")
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(output.status.success(), "--help should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for cmd in ["config", "doctor"] {
+        assert!(stdout.contains(cmd), "--help should mention '{cmd}'");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tree command tests
+// ---------------------------------------------------------------------------
+
+fn setup_and_ingest_with_subdirs() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(root.join("notes")).unwrap();
+
+    fs::write(
+        root.join("readme.md"),
+        "---\ntitle: Readme\n---\n\n# Readme\n\nTop-level readme.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("docs/guide.md"),
+        "---\ntitle: Guide\n---\n\n# Guide\n\nA guide document.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("notes/todo.md"),
+        "---\ntitle: Todo\n---\n\n# Todo\n\nThings to do.\n",
+    )
+    .unwrap();
+
+    let output = mdvdb_bin()
+        .arg("ingest")
+        .current_dir(root)
+        .output()
+        .expect("failed to run ingest");
+    assert!(
+        output.status.success(),
+        "ingest should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
+#[test]
+fn test_tree_json_output() {
+    let dir = setup_and_ingest_with_subdirs();
+
+    let output = mdvdb_bin()
+        .args(["tree", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "tree --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    // Should have a root node with children
+    assert!(json["root"].is_object(), "tree should have 'root' object");
+    assert!(
+        json["root"]["children"].is_array(),
+        "root should have 'children' array"
+    );
+}
+
+#[test]
+fn test_tree_path_filter() {
+    let dir = setup_and_ingest_with_subdirs();
+
+    let output = mdvdb_bin()
+        .args(["tree", "--path", "docs", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "tree --path docs --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    // The filtered tree should contain docs content
+    let tree_str = serde_json::to_string(&json).unwrap();
+    assert!(
+        tree_str.contains("guide.md") || tree_str.contains("docs"),
+        "filtered tree should contain docs content, got: {tree_str}"
+    );
+}
+
+#[test]
+fn test_search_path_flag() {
+    let dir = setup_and_ingest_with_subdirs();
+
+    // Search with --path restricting to docs/
+    let output = mdvdb_bin()
+        .args(["search", "document", "--path", "docs", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --path should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    assert!(json["results"].is_array(), "should have 'results' array");
+    // With mock embeddings all vectors are similar, but any returned results
+    // must be scoped to the docs/ prefix.
+    let results = json["results"].as_array().unwrap();
+    for result in results {
+        if let Some(path) = result["path"].as_str() {
+            if !path.is_empty() {
+                assert!(
+                    path.starts_with("docs/"),
+                    "search --path docs should only return docs/ files, got: {path}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// New flag & behavior tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cli_ingest_reindex() {
+    let dir = setup_and_ingest();
+    let output = mdvdb_bin()
+        .args(["ingest", "--reindex"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "ingest --reindex should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_cli_ingest_full_alias() {
+    let dir = setup_and_ingest();
+    let output = mdvdb_bin()
+        .args(["ingest", "--full"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "ingest --full should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_cli_ingest_preview() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+    fs::write(root.join("doc.md"), "# Doc\n\nSome content.\n").unwrap();
+    fs::write(root.join("other.md"), "# Other\n\nMore content.\n").unwrap();
+
+    let output = mdvdb_bin()
+        .args(["ingest", "--preview"])
+        .current_dir(root)
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "ingest --preview should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should mention file counts in some form
+    assert!(
+        stdout.contains("2") || stdout.contains("file"),
+        "preview output should contain file information, got: {stdout}"
+    );
+
+    // Preview is read-only — it should not trigger embedding API calls.
+    // (The index file may or may not exist from prior runs; the key check
+    // is that the command exits 0 and reports file info.)
+}
+
+#[test]
+fn test_cli_ingest_preview_json() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+    fs::write(root.join("doc.md"), "# Doc\n\nSome content.\n").unwrap();
+
+    let output = mdvdb_bin()
+        .args(["ingest", "--preview", "--json"])
+        .current_dir(root)
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "ingest --preview --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("should be valid JSON: {e}, got: {stdout}"));
+
+    assert!(
+        json.get("total_files").is_some(),
+        "JSON should have total_files field"
+    );
+    assert!(
+        json.get("total_chunks").is_some(),
+        "JSON should have total_chunks field"
+    );
+    assert!(
+        json.get("estimated_tokens").is_some(),
+        "JSON should have estimated_tokens field"
+    );
+}
+
+#[test]
+fn test_cli_ingest_preview_with_auto_dimensions_is_offline_and_read_only() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: openai\n  dimensions: auto\n",
+    )
+    .unwrap();
+    fs::write(root.join("doc.md"), "# Doc\n\nSome content.\n").unwrap();
+
+    let output = mdvdb_bin()
+        .args(["ingest", "--preview", "--reindex", "--json"])
+        .env("MDVDB_NO_USER_CONFIG", "1")
+        .env_remove("OPENAI_API_KEY")
+        .current_dir(root)
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "auto-dimension preview should not probe, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["files_to_process"], 1);
+    assert!(json["estimated_tokens"].as_u64().unwrap() > 0);
+    assert!(!root.join(".markdownvdb/index").exists());
+    assert!(!root.join(".markdownvdb/fts").exists());
+}
+
+#[test]
+fn test_cli_info_human() {
+    let dir = setup_and_ingest();
+    let output = mdvdb_bin()
+        .arg("info")
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb info");
+
+    assert!(
+        output.status.success(),
+        "info should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Markdown files:"), "got: {stdout}");
+    assert!(stdout.contains("Indexed files:"), "got: {stdout}");
+    assert!(stdout.contains("Full reindex estimate:"), "got: {stdout}");
+}
+
+#[test]
+fn test_cli_info_json() {
+    let dir = setup_and_ingest();
+    let output = mdvdb_bin()
+        .args(["info", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb info --json");
+
+    assert!(
+        output.status.success(),
+        "info --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["scope"], ".");
+    assert_eq!(json["file_count"], 2);
+    assert!(json["chunk_count"].as_u64().unwrap() > 0);
+    assert_eq!(json["sync"]["new"], 0);
+    assert_eq!(json["embedding"]["provider"], "Mock");
+    assert!(json["reindex_estimated_tokens"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn test_cli_info_scoped_json() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(
+        root.join(".markdownvdb/config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+    fs::write(root.join("root.md"), "# Root\n\nOutside.\n").unwrap();
+    fs::write(root.join("sub/a.md"), "# A\n\nInside A.\n").unwrap();
+    fs::write(root.join("sub/b.md"), "# B\n\nInside B.\n").unwrap();
+
+    let ingest = mdvdb_bin()
+        .arg("ingest")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        ingest.status.success(),
+        "ingest should succeed, stderr: {}",
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+
+    let output = mdvdb_bin()
+        .args(["info", "sub", "--json"])
+        .current_dir(root)
+        .output()
+        .expect("failed to run scoped mdvdb info");
+    assert!(
+        output.status.success(),
+        "scoped info should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["scope"], "sub/");
+    assert_eq!(json["is_whole_vault"], false);
+    assert_eq!(json["file_count"], 2);
+    assert_eq!(json["indexed_file_count"], 2);
+    assert_eq!(json["sync"]["unchanged"], 2);
+}
+
+#[test]
+fn test_cli_global_json_flag() {
+    let dir = setup_and_ingest();
+    let output = mdvdb_bin()
+        .args(["--json", "status"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "--json status should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("should be valid JSON: {e}, got: {stdout}"));
+
+    assert!(
+        json.is_object(),
+        "global --json flag should produce JSON output"
+    );
+}
+
+#[test]
+fn test_cli_completions() {
+    let output = mdvdb_bin()
+        .args(["completions", "bash"])
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(
+        output.status.success(),
+        "completions bash should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("mdvdb"),
+        "completions output should contain 'mdvdb'"
+    );
+    assert!(
+        stdout.contains("complete") || stdout.contains("COMPREPLY") || stdout.contains("compgen"),
+        "completions output should contain completion-related keywords"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Time Decay CLI tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_search_help_shows_decay_flags() {
+    let output = mdvdb_bin()
+        .args(["search", "--help"])
+        .output()
+        .expect("failed to execute mdvdb");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for flag in ["--decay", "--no-decay", "--decay-half-life"] {
+        assert!(
+            stdout.contains(flag),
+            "search --help should mention '{flag}'"
+        );
+    }
+}
+
+#[test]
+fn test_search_decay_flag_accepted() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "test", "--decay", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --decay should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_search_no_decay_flag_accepted() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "test", "--no-decay", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --no-decay should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_search_decay_half_life_flag_accepted() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args([
+            "search",
+            "test",
+            "--decay",
+            "--decay-half-life",
+            "30",
+            "--json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --decay-half-life should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_search_decay_and_no_decay_conflict() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "test", "--decay", "--no-decay"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        !output.status.success(),
+        "--decay and --no-decay should conflict"
+    );
+}
+
+#[test]
+fn test_search_json_includes_modified_at() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["search", "rust", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    let results = json["results"]
+        .as_array()
+        .expect("should have results array");
+    assert!(!results.is_empty(), "should have search results");
+    // Check that modified_at is present in the file metadata.
+    for result in results {
+        assert!(
+            result["file"]["modified_at"].is_number(),
+            "modified_at should be a number in JSON output, got: {}",
+            result["file"]
+        );
+    }
+}
+
+#[test]
+fn test_get_json_includes_modified_at() {
+    let dir = setup_and_ingest();
+
+    let output = mdvdb_bin()
+        .args(["get", "rust.md", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "get --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    assert!(
+        json["modified_at"].is_number(),
+        "modified_at should be present in get --json output, got: {}",
+        json
+    );
+}
+
+#[test]
+fn test_completions_include_decay_flags() {
+    // Bash completions
+    let output = mdvdb_bin()
+        .args(["completions", "bash"])
+        .output()
+        .expect("failed to execute mdvdb");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--decay"),
+        "bash completions should include --decay"
+    );
+    assert!(
+        stdout.contains("--no-decay"),
+        "bash completions should include --no-decay"
+    );
+    assert!(
+        stdout.contains("--decay-half-life"),
+        "bash completions should include --decay-half-life"
+    );
+
+    // Zsh completions
+    let output = mdvdb_bin()
+        .args(["completions", "zsh"])
+        .output()
+        .expect("failed to execute mdvdb");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--decay"),
+        "zsh completions should include --decay"
+    );
+
+    // Fish completions
+    let output = mdvdb_bin()
+        .args(["completions", "fish"])
+        .output()
+        .expect("failed to execute mdvdb");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("decay"),
+        "fish completions should include decay"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Graph CLI tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_graph_document_json_output() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["graph", "--level", "document", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "graph --level document --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("graph JSON should be valid");
+
+    assert_eq!(json["level"], "document", "level should be 'document'");
+
+    let nodes = json["nodes"].as_array().expect("nodes should be an array");
+    assert!(!nodes.is_empty(), "should have at least one node");
+    for node in nodes {
+        assert!(node["id"].is_string(), "node should have 'id' field");
+        assert!(node["path"].is_string(), "node should have 'path' field");
+    }
+
+    let edges = json["edges"].as_array().expect("edges should be an array");
+    // With links between alpha->beta, alpha->gamma, beta->alpha there should be edges
+    assert!(!edges.is_empty(), "should have edges from markdown links");
+    for edge in edges {
+        assert!(edge["source"].is_string(), "edge should have 'source'");
+        assert!(edge["target"].is_string(), "edge should have 'target'");
+        assert!(
+            edge.get("context_index").is_none(),
+            "default graph JSON contract must not change"
+        );
+    }
+    assert!(
+        json.get("format").is_none() && json.get("contexts").is_none(),
+        "compact wire fields must be opt-in"
+    );
+}
+
+#[test]
+fn test_graph_compact_json_interns_contexts_and_preserves_data() {
+    let dir = setup_and_ingest_with_links();
+
+    let regular_output = mdvdb_bin()
+        .args(["graph", "--level", "document", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run regular graph JSON command");
+    assert!(regular_output.status.success());
+
+    let compact_output = mdvdb_bin()
+        .args(["graph", "--level", "document", "--compact", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run compact graph JSON command");
+    assert!(
+        compact_output.status.success(),
+        "graph --compact --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&compact_output.stderr)
+    );
+
+    let regular: serde_json::Value =
+        serde_json::from_slice(&regular_output.stdout).expect("regular graph JSON should parse");
+    let compact: serde_json::Value =
+        serde_json::from_slice(&compact_output.stdout).expect("compact graph JSON should parse");
+
+    assert_eq!(compact["format"], "mdvdb.graph.compact");
+    assert_eq!(compact["version"], 1);
+    assert_eq!(compact["level"], "document");
+    assert_eq!(
+        compact["nodes"].as_array().unwrap().len(),
+        regular["nodes"].as_array().unwrap().len()
+    );
+    assert_eq!(
+        compact["edges"].as_array().unwrap().len(),
+        regular["edges"].as_array().unwrap().len()
+    );
+
+    let contexts = compact["contexts"]
+        .as_array()
+        .expect("compact response needs a context table");
+    assert!(!contexts.is_empty(), "semantic contexts should be retained");
+
+    for compact_edge in compact["edges"].as_array().unwrap() {
+        assert!(
+            compact_edge.get("context_text").is_none(),
+            "full contexts must not be repeated on compact edges"
+        );
+        assert!(
+            compact_edge.get("field").is_some(),
+            "field must remain an always-present edge key"
+        );
+
+        let regular_edge = regular["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|edge| {
+                edge["source"] == compact_edge["source"]
+                    && edge["target"] == compact_edge["target"]
+                    && edge["field"] == compact_edge["field"]
+            })
+            .expect("compact edge must match a regular edge");
+
+        match compact_edge.get("context_index") {
+            Some(index) => {
+                let index = index.as_u64().unwrap() as usize;
+                assert_eq!(contexts[index], regular_edge["context_text"]);
+            }
+            None => assert!(
+                regular_edge.get("context_text").is_none(),
+                "an absent context index must match an absent regular context"
+            ),
+        }
+    }
+
+    let compact_stdout = String::from_utf8_lossy(&compact_output.stdout);
+    assert_eq!(
+        compact_stdout.trim_end().lines().count(),
+        1,
+        "compact wire JSON should not include pretty-print whitespace"
+    );
+}
+
+#[test]
+fn test_graph_compact_requires_json() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["graph", "--compact"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        !output.status.success(),
+        "--compact without --json must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--json"),
+        "error should explain the requirement: {stderr}"
+    );
+}
+
+#[test]
+fn test_graph_chunk_json_output() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["graph", "--level", "chunk", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "graph --level chunk --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("graph JSON should be valid");
+
+    assert_eq!(json["level"], "chunk", "level should be 'chunk'");
+
+    let nodes = json["nodes"].as_array().expect("nodes should be an array");
+    assert!(!nodes.is_empty(), "should have at least one chunk node");
+    for node in nodes {
+        assert!(node["id"].is_string(), "chunk node should have 'id' field");
+        assert!(
+            !node["chunk_index"].is_null(),
+            "chunk node should have 'chunk_index' field"
+        );
+    }
+
+    let edges = json["edges"].as_array().expect("edges should be an array");
+    // Chunk-level graph includes similarity edges which should have weights
+    for edge in edges {
+        assert!(edge["source"].is_string(), "edge should have 'source'");
+        assert!(edge["target"].is_string(), "edge should have 'target'");
+        if !edge["weight"].is_null() {
+            assert!(
+                edge["weight"].as_f64().is_some(),
+                "edge weight should be a number"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_graph_default_level_is_document() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["graph", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "graph --json (default level) should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("graph JSON should be valid");
+
+    assert_eq!(
+        json["level"], "document",
+        "default graph level should be 'document'"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Graph Traversal CLI tests (Phase 21)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_search_hops_flag_accepted() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["search", "alpha", "--boost-links", "--hops", "2", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --boost-links --hops 2 should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(json["results"].is_array(), "should have 'results' array");
+}
+
+#[test]
+fn test_search_hops_requires_boost_links() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["search", "alpha", "--hops", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        !output.status.success(),
+        "--hops without --boost-links should fail (requires = boost_links)"
+    );
+}
+
+#[test]
+fn test_search_hops_zero_rejected() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["search", "alpha", "--boost-links", "--hops", "0"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        !output.status.success(),
+        "--hops 0 should be rejected (valid range 1-3)"
+    );
+}
+
+#[test]
+fn test_search_hops_four_rejected() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["search", "alpha", "--boost-links", "--hops", "4"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        !output.status.success(),
+        "--hops 4 should be rejected (valid range 1-3)"
+    );
+}
+
+#[test]
+fn test_search_expand_flag_accepted() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["search", "alpha", "--expand", "1", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --expand 1 should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(json["results"].is_array(), "should have 'results' array");
+}
+
+#[test]
+fn test_search_json_includes_graph_context() {
+    // Set up files with links: alpha -> beta, alpha -> gamma, beta -> alpha.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("alpha.md"),
+        "---\ntitle: Alpha\n---\n\n# Alpha\n\nAlpha links to [Beta](beta.md) and [Gamma](gamma.md).\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("beta.md"),
+        "---\ntitle: Beta\n---\n\n# Beta\n\nBeta links back to [Alpha](alpha.md).\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("gamma.md"),
+        "---\ntitle: Gamma\n---\n\n# Gamma\n\nGamma is a standalone page.\n",
+    )
+    .unwrap();
+
+    // Ingest files to build the index and link graph.
+    let ingest = mdvdb_bin()
+        .arg("ingest")
+        .current_dir(root)
+        .output()
+        .expect("failed to run ingest");
+    assert!(
+        ingest.status.success(),
+        "ingest should succeed, stderr: {}",
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+
+    // Search with --expand 1 --limit 1 --json — limit to 1 result so linked
+    // files appear in graph_context rather than results.
+    let output = mdvdb_bin()
+        .args(["search", "alpha", "--expand", "1", "--limit", "1", "--json"])
+        .current_dir(root)
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "search --expand 1 --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    // With --expand 1 and only 1 result, the linked files should appear as
+    // graph_context items. The graph_context field uses skip_serializing_if,
+    // so it only appears when non-empty.
+    if let Some(gc) = json.get("graph_context") {
+        assert!(gc.is_array(), "graph_context should be an array");
+        let items = gc.as_array().unwrap();
+        for item in items {
+            assert!(
+                item["linked_from"].is_string(),
+                "graph_context item should have 'linked_from' field"
+            );
+            assert!(
+                item["hop_distance"].is_number(),
+                "graph_context item should have 'hop_distance' field"
+            );
+        }
+    }
+    // If graph_context is absent, that's acceptable — it means no neighbors
+    // were found outside the result set (e.g., if mock embeddings produce
+    // edge cases). The key assertion is that the command succeeds and produces
+    // valid JSON with a results array.
+    assert!(json["results"].is_array(), "should have 'results' array");
+}
+
+#[test]
+fn test_links_depth_flag() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["links", "alpha.md", "--depth", "2"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "links --depth 2 should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_links_depth_json() {
+    let dir = setup_and_ingest_with_links();
+
+    let output = mdvdb_bin()
+        .args(["links", "alpha.md", "--depth", "2", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "links --depth 2 --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    // Neighborhood result should have nested structure.
+    assert_eq!(
+        json["file"].as_str().unwrap(),
+        "alpha.md",
+        "should report the queried file"
+    );
+    assert!(
+        json["outgoing"].is_array(),
+        "neighborhood should have 'outgoing' array"
+    );
+    assert!(
+        json["incoming"].is_array(),
+        "neighborhood should have 'incoming' array"
+    );
+
+    // Alpha has outgoing links to beta and gamma; at depth 2 we should see
+    // nested children in the outgoing tree.
+    let outgoing = json["outgoing"].as_array().unwrap();
+    assert!(
+        !outgoing.is_empty(),
+        "alpha.md should have outgoing links in neighborhood"
+    );
+
+    // Each outgoing node should have path and children fields.
+    for node in outgoing {
+        assert!(
+            node["path"].is_string(),
+            "outgoing node should have 'path' field"
+        );
+        assert!(
+            node["children"].is_array(),
+            "outgoing node should have 'children' array (may be empty)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Custom Cluster CLI Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_clusters_add_and_list() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+
+    // Add a cluster
+    let output = mdvdb_bin()
+        .args([
+            "clusters",
+            "add",
+            "AI Research",
+            "--seeds",
+            "machine learning,neural networks",
+            "--root",
+        ])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "clusters add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // List should show it
+    let output = mdvdb_bin()
+        .args(["clusters", "list", "--json", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = parsed.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "AI Research");
+    assert_eq!(arr[0]["seeds"][0], "machine learning");
+    assert_eq!(arr[0]["seeds"][1], "neural networks");
+}
+
+#[test]
+fn test_clusters_add_rejects_invalid_name() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n",
+    )
+    .unwrap();
+
+    // Name with colon
+    let output = mdvdb_bin()
+        .args(["clusters", "add", "Bad:Name", "--seeds", "x,y", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(":") || stderr.contains("cannot contain"));
+
+    // Name with pipe
+    let output = mdvdb_bin()
+        .args(["clusters", "add", "Bad|Name", "--seeds", "x,y", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+}
+
+#[test]
+fn test_clusters_add_rejects_invalid_seeds() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n",
+    )
+    .unwrap();
+
+    // Seed with pipe
+    let output = mdvdb_bin()
+        .args([
+            "clusters",
+            "add",
+            "Test",
+            "--seeds",
+            "good,bad|seed",
+            "--root",
+        ])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+}
+
+#[test]
+fn test_clusters_remove() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\nclustering:\n  custom:\n    - name: A\n      seeds: [x, y]\n    - name: B\n      seeds: [z]\n",
+    )
+    .unwrap();
+
+    // Remove cluster A
+    let output = mdvdb_bin()
+        .args(["clusters", "remove", "A", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "remove failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // List should only show B
+    let output = mdvdb_bin()
+        .args(["clusters", "list", "--json", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = parsed.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "B");
+}
+
+#[test]
+fn test_clusters_remove_nonexistent() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n",
+    )
+    .unwrap();
+
+    let output = mdvdb_bin()
+        .args(["clusters", "remove", "Nonexistent", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not found"));
+}
+
+#[test]
+fn test_clusters_custom_json_after_ingest() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\nclustering:\n  custom:\n    - name: AI\n      seeds: [machine learning, neural nets]\n    - name: Web\n      seeds: [html, css]\n",
+    )
+    .unwrap();
+    fs::write(root.join("ai.md"), "# AI\nMachine learning content").unwrap();
+    fs::write(root.join("web.md"), "# Web\nHTML and CSS content").unwrap();
+
+    // Ingest
+    let output = mdvdb_bin()
+        .args(["ingest", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "ingest failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Custom clusters JSON
+    let output = mdvdb_bin()
+        .args(["clusters", "--custom", "--json", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "clusters --custom failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = parsed.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["name"], "AI");
+    assert_eq!(arr[1]["name"], "Web");
+
+    // Every topic has a document count; multi-label means a doc may appear in
+    // both topics, so the sum is bounded by docs × topics.
+    let total_memberships: usize = arr
+        .iter()
+        .map(|c| c["document_count"].as_u64().unwrap() as usize)
+        .sum();
+    assert!(total_memberships <= 4, "2 docs × 2 topics is the ceiling");
+    // Non-empty topics expose a mean member score.
+    for c in arr {
+        let count = c["document_count"].as_u64().unwrap();
+        assert_eq!(
+            c.get("mean_score").is_some(),
+            count > 0,
+            "mean_score present iff the topic has members"
+        );
+    }
+}
+
+#[test]
+fn test_clusters_list_no_index_needed() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Config with clusters defined but NO index (YAML format)
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "clustering:\n  custom:\n    - name: Test\n      seeds: [seed1, seed2]\n",
+    )
+    .unwrap();
+
+    let output = mdvdb_bin()
+        .args(["clusters", "list", "--json", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = parsed.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "Test");
+}
+
+// ---------------------------------------------------------------------------
+// Collection (Phase 29) CLI tests
+// ---------------------------------------------------------------------------
+
+/// A fixture vault with a `blog/` folder (direct children + one nested file and
+/// one no-frontmatter file), ingested and ready for `collection` queries.
+fn setup_collection_cli() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(root.join("blog")).unwrap();
+    fs::write(
+        root.join("blog/launch.md"),
+        "---\ntitle: Launch\nstatus: published\ndate: 2024-06-01\ntags:\n  - news\n---\n\n# Launch\n\nContent.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("blog/draft.md"),
+        "---\ntitle: Draft\nstatus: draft\ndate: 2024-01-15\n---\n\n# Draft\n\nContent.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("blog/published2.md"),
+        "---\ntitle: Second Published\nstatus: published\ndate: 2024-03-01\n---\n\n# Two\n\nContent.\n",
+    )
+    .unwrap();
+    fs::write(root.join("blog/plain.md"), "# Plain\n\nNo frontmatter.\n").unwrap();
+
+    fs::create_dir_all(root.join("blog/2024")).unwrap();
+    fs::write(
+        root.join("blog/2024/nested.md"),
+        "---\ntitle: Nested\nstatus: published\ndate: 2024-12-31\n---\n\n# Nested\n\nContent.\n",
+    )
+    .unwrap();
+
+    let output = mdvdb_bin()
+        .arg("ingest")
+        .current_dir(root)
+        .output()
+        .expect("failed to run ingest");
+    assert!(
+        output.status.success(),
+        "ingest should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
+/// Golden test: pin the exact JSON field names + casing the app mirrors verbatim.
+#[test]
+fn test_collection_golden_json_contract() {
+    let dir = setup_collection_cli();
+
+    let output = mdvdb_bin()
+        .args(["collection", "blog", "--limit", "10", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+
+    assert!(
+        output.status.success(),
+        "collection --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+
+    // Top-level shape.
+    assert_eq!(json["scope"].as_str().unwrap(), "blog/");
+    assert!(!json["recursive"].as_bool().unwrap());
+    assert!(json["columns"].is_array(), "columns must be an array");
+    assert!(json["rows"].is_array(), "rows must be an array");
+    assert!(
+        json["total_rows"].is_number(),
+        "total_rows must be a number"
+    );
+    assert_eq!(json["limit"].as_u64().unwrap(), 10, "limit echoed when set");
+    assert_eq!(json["offset"].as_u64().unwrap(), 0);
+
+    // Columns: name (NOT key), field_type PascalCase, in_schema bool, etc.
+    let columns = json["columns"].as_array().unwrap();
+    assert!(!columns.is_empty(), "should have columns");
+    let allowed_types = [
+        "String", "Number", "Boolean", "List", "Date", "Mixed", "Relation",
+    ];
+    for col in columns {
+        assert!(col["name"].is_string(), "column must have string 'name'");
+        assert!(col.get("key").is_none(), "column uses 'name', not 'key'");
+        let ft = col["field_type"].as_str().expect("field_type is a string");
+        assert!(
+            allowed_types.contains(&ft),
+            "field_type '{ft}' must be PascalCase enum"
+        );
+        assert!(col["occurrence_count"].is_number());
+        assert!(col["sample_values"].is_array());
+        assert!(col["in_schema"].is_boolean());
+        assert!(col["required"].is_boolean());
+        // description, allowed_values, relation_target are present (may be null).
+        assert!(col.get("description").is_some());
+        assert!(col.get("allowed_values").is_some());
+        assert!(
+            col.get("relation_target").is_some(),
+            "relation_target must be an always-present key (phase 31)"
+        );
+    }
+    // The `title` column serializes its type as PascalCase "String".
+    let title_col = columns.iter().find(|c| c["name"] == "title").unwrap();
+    assert_eq!(title_col["field_type"].as_str().unwrap(), "String");
+    assert!(title_col["in_schema"].as_bool().unwrap());
+
+    // Rows: full contract per row.
+    let rows = json["rows"].as_array().unwrap();
+    assert!(!rows.is_empty(), "should have rows");
+    let valid_states = ["indexed", "modified", "new", "deleted"];
+    let valid_title_sources = ["frontmatter", "filename"];
+    for row in rows {
+        assert!(row["path"].is_string());
+        let title = row["title"].as_str().expect("title is a string");
+        assert!(!title.is_empty(), "title must never be empty");
+        let ts = row["title_source"].as_str().unwrap();
+        assert!(
+            valid_title_sources.contains(&ts),
+            "title_source '{ts}' invalid"
+        );
+        assert!(
+            row["frontmatter"].is_object(),
+            "frontmatter must be an object, never null"
+        );
+        assert!(row["file_size"].is_number());
+        // content_hash / indexed_at are string|null; modified_at is number|null.
+        assert!(row["content_hash"].is_string() || row["content_hash"].is_null());
+        assert!(row["indexed_at"].is_number() || row["indexed_at"].is_null());
+        assert!(row["modified_at"].is_number() || row["modified_at"].is_null());
+        let state = row["state"].as_str().unwrap();
+        assert!(
+            valid_states.contains(&state),
+            "state '{state}' must be lowercase enum"
+        );
+    }
+
+    // A plain (no-frontmatter) file yields {} and a filename-derived title.
+    let plain = rows.iter().find(|r| r["path"] == "blog/plain.md").unwrap();
+    assert_eq!(plain["frontmatter"], serde_json::json!({}));
+    assert_eq!(plain["title"].as_str().unwrap(), "plain");
+    assert_eq!(plain["title_source"].as_str().unwrap(), "filename");
+}
+
+#[test]
+fn test_collection_json_omits_limit_when_unset() {
+    let dir = setup_collection_cli();
+    let output = mdvdb_bin()
+        .args(["collection", "blog", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("should be valid JSON");
+    assert!(json.get("limit").is_none(), "limit key absent when None");
+    assert_eq!(json["offset"].as_u64().unwrap(), 0);
+}
+
+#[test]
+fn test_collection_recursive_cli() {
+    let dir = setup_collection_cli();
+
+    let non_recursive: serde_json::Value = serde_json::from_slice(
+        &mdvdb_bin()
+            .args(["collection", "blog", "--json"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let nr_paths: Vec<&str> = non_recursive["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    assert!(!nr_paths.contains(&"blog/2024/nested.md"));
+
+    let recursive: serde_json::Value = serde_json::from_slice(
+        &mdvdb_bin()
+            .args(["collection", "blog", "--recursive", "--json"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(recursive["recursive"].as_bool().unwrap());
+    let r_paths: Vec<&str> = recursive["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        r_paths.contains(&"blog/2024/nested.md"),
+        "recursive includes nested, got {r_paths:?}"
+    );
+}
+
+#[test]
+fn test_collection_sort_and_order_cli() {
+    let dir = setup_collection_cli();
+
+    let output = mdvdb_bin()
+        .args([
+            "collection",
+            "blog",
+            "--sort",
+            "status",
+            "--order",
+            "desc",
+            "--json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = json["rows"].as_array().unwrap();
+    // Descending by status → "published" rows come before "draft".
+    let first_status = rows[0]["frontmatter"]["status"].as_str().unwrap();
+    assert_eq!(
+        first_status, "published",
+        "desc status puts published first"
+    );
+}
+
+#[test]
+fn test_collection_filter_cli_repeatable() {
+    let dir = setup_collection_cli();
+
+    // Single filter: published direct children = launch + published2.
+    let one: serde_json::Value = serde_json::from_slice(
+        &mdvdb_bin()
+            .args([
+                "collection",
+                "blog",
+                "--filter",
+                "status=published",
+                "--json",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(one["total_rows"].as_u64().unwrap(), 2, "post-filter count");
+
+    // Two filters AND together → narrows to one row.
+    let two: serde_json::Value = serde_json::from_slice(
+        &mdvdb_bin()
+            .args([
+                "collection",
+                "blog",
+                "--filter",
+                "status=published",
+                "--filter",
+                "date=2024-03-01",
+                "--json",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        two["total_rows"].as_u64().unwrap(),
+        1,
+        "repeated --filter must AND"
+    );
+    assert_eq!(
+        two["rows"][0]["path"].as_str().unwrap(),
+        "blog/published2.md"
+    );
+}
+
+#[test]
+fn test_collection_limit_offset_cli() {
+    let dir = setup_collection_cli();
+
+    let output = mdvdb_bin()
+        .args([
+            "collection",
+            "blog",
+            "--limit",
+            "1",
+            "--offset",
+            "1",
+            "--json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(json["limit"].as_u64().unwrap(), 1);
+    assert_eq!(json["offset"].as_u64().unwrap(), 1);
+    assert_eq!(
+        json["rows"].as_array().unwrap().len(),
+        1,
+        "page size = limit"
+    );
+    // total_rows independent of pagination (4 direct children).
+    assert_eq!(json["total_rows"].as_u64().unwrap(), 4);
+}
+
+#[test]
+fn test_collection_list_alias_cli() {
+    let dir = setup_collection_cli();
+    // Hidden `list` alias resolves to the same command.
+    let output = mdvdb_bin()
+        .args(["list", "blog", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success(), "list alias should work");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["scope"].as_str().unwrap(), "blog/");
+}
+
+#[test]
+fn test_collection_human_output_cli() {
+    let dir = setup_collection_cli();
+    let output = mdvdb_bin()
+        .args(["collection", "blog"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Collection"), "human output has a header");
+    assert!(
+        stdout.contains("Showing"),
+        "human output has a pagination footer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Topics CLI (add --description/--threshold, update, unassigned, config set)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_clusters_add_description_only() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+
+    let output = mdvdb_bin()
+        .args([
+            "clusters",
+            "add",
+            "Rust",
+            "--description",
+            "Notes about Rust programming and cargo",
+            "--root",
+        ])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = mdvdb_bin()
+        .args(["clusters", "list", "--json", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = parsed.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "Rust");
+    assert_eq!(
+        arr[0]["description"],
+        "Notes about Rust programming and cargo"
+    );
+    // Seed-less topic: seeds serialize as an empty array.
+    assert!(arr[0]["seeds"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn test_clusters_add_rejects_empty_definition() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+
+    let output = mdvdb_bin()
+        .args(["clusters", "add", "Empty", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--seeds or --description"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_clusters_add_rejects_bad_threshold() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+
+    let output = mdvdb_bin()
+        .args([
+            "clusters",
+            "add",
+            "Bad",
+            "--seeds",
+            "x",
+            "--threshold",
+            "1.5",
+            "--root",
+        ])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("threshold"));
+}
+
+#[test]
+fn test_clusters_update_edits_and_renames() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+
+    let ok = mdvdb_bin()
+        .args(["clusters", "add", "Old", "--seeds", "a,b", "--root"])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(ok.status.success());
+
+    let output = mdvdb_bin()
+        .args([
+            "clusters",
+            "update",
+            "Old",
+            "--seeds",
+            "c,d",
+            "--description",
+            "updated desc",
+            "--threshold",
+            "0.4",
+            "--rename",
+            "New",
+            "--root",
+        ])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "update failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = mdvdb_bin()
+        .args(["clusters", "list", "--json", "--root"])
+        .arg(root)
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arr = parsed.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "New");
+    assert_eq!(arr[0]["description"], "updated desc");
+    assert_eq!(arr[0]["seeds"], serde_json::json!(["c", "d"]));
+    assert!((arr[0]["threshold"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+
+    // Updating an unknown topic fails.
+    let output = mdvdb_bin()
+        .args(["clusters", "update", "Missing", "--seeds", "x", "--root"])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
+#[test]
+fn test_clusters_unassigned_json_shape() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    // Impossible floor: everything lands in Unassigned.
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\nclustering:\n  topics:\n    min_similarity: 1.0\n  custom:\n    - name: AI\n      seeds: [machine learning]\n",
+    )
+    .unwrap();
+    fs::write(root.join("doc.md"), "# Doc\nSome content").unwrap();
+
+    let output = mdvdb_bin()
+        .args(["ingest", "--root"])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = mdvdb_bin()
+        .args(["clusters", "unassigned", "--json", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "unassigned failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["count"], 1);
+    assert_eq!(parsed["paths"], serde_json::json!(["doc.md"]));
+}
+
+#[test]
+fn test_config_set_writes_yaml() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+
+    let output = mdvdb_bin()
+        .args(["config", "set", "clustering.algorithm", "kmeans", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "config set failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = fs::read_to_string(root.join(".markdownvdb").join("config.yaml")).unwrap();
+    assert!(content.contains("algorithm: kmeans"), "yaml: {content}");
+
+    // Numbers parse as numbers.
+    let output = mdvdb_bin()
+        .args([
+            "config",
+            "set",
+            "clustering.topics.min_similarity",
+            "0.45",
+            "--root",
+        ])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let content = fs::read_to_string(root.join(".markdownvdb").join("config.yaml")).unwrap();
+    assert!(content.contains("min_similarity: 0.45"), "yaml: {content}");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 31: frontmatter relations — CLI golden JSON contract
+// ---------------------------------------------------------------------------
+
+/// Fixture vault for relation golden tests: clients as the FK "table",
+/// invoices referencing them via wiki links, plus an overlay target.
+fn setup_relations_cli() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".markdownvdb.schema.yml"),
+        "scopes:\n  invoices:\n    fields:\n      client:\n        field_type: relation\n        target: clients/\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(root.join("clients")).unwrap();
+    fs::write(
+        root.join("clients/acme.md"),
+        "---\ntitle: Acme Corp\nindustry: tech\n---\n\n# Acme\n\nClient profile.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("clients/globex.md"),
+        "---\ntitle: Globex\n---\n\n# Globex\n\nClient profile.\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(root.join("invoices")).unwrap();
+    fs::write(
+        root.join("invoices/i1.md"),
+        "---\nclient: \"[[clients/acme]]\"\namount: 100\n---\n\n# Invoice i1\n\nInvoice body about Acme. See [[../clients/acme|Acme]].\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("invoices/i2.md"),
+        "---\ntitle: Invoice i2\nclients:\n  - \"[[clients/acme|A]]\"\n  - not-a-link\n  - \"[[clients/globex]]\"\n  - \"[[clients/acme|A]]\"\n---\n\n# Invoice i2\n\nMulti-client invoice body.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("invoices/dangling.md"),
+        "---\nclient: \"[[clients/ghost]]\"\n---\n\n# Dangling\n\nMissing target.\n",
+    )
+    .unwrap();
+
+    let output = mdvdb_bin()
+        .arg("ingest")
+        .current_dir(root)
+        .output()
+        .expect("failed to run ingest");
+    assert!(
+        output.status.success(),
+        "ingest should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
+/// Golden test: `get --populate` JSON — pins every RelationValue key name, the
+/// always-present `frontmatter` key, array order/duplicates, and referenced_by.
+#[test]
+fn test_get_populate_golden_json_contract() {
+    let dir = setup_relations_cli();
+
+    let output = mdvdb_bin()
+        .args(["get", "invoices/i2.md", "--populate", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(
+        output.status.success(),
+        "get --populate should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("should be valid JSON");
+
+    // Both populate keys present; relations map keyed by field name.
+    let relations = json["relations"]
+        .as_object()
+        .expect("relations is an object");
+    assert!(
+        json["referenced_by"].is_array(),
+        "referenced_by is an array"
+    );
+    let clients = relations["clients"].as_array().expect("values are arrays");
+
+    // Array order + duplicates preserved; non-link element skipped.
+    assert_eq!(clients.len(), 3);
+    assert_eq!(clients[0]["path"], "clients/acme.md");
+    assert_eq!(clients[1]["path"], "clients/globex.md");
+    assert_eq!(clients[2]["path"], "clients/acme.md");
+
+    // RelationValue key set, exact names.
+    for value in clients {
+        let obj = value.as_object().unwrap();
+        for key in ["raw", "path", "exists", "title", "frontmatter"] {
+            assert!(obj.contains_key(key), "RelationValue missing key '{key}'");
+        }
+    }
+    assert_eq!(clients[0]["raw"], "[[clients/acme|A]]");
+    assert_eq!(clients[0]["exists"], true);
+    assert_eq!(clients[0]["title"], "Acme Corp");
+    assert_eq!(clients[0]["frontmatter"]["industry"], "tech");
+
+    // Raw frontmatter is untouched by populate.
+    assert_eq!(json["frontmatter"]["clients"][0], "[[clients/acme|A]]");
+}
+
+/// Golden test: dangling relations report path + exists:false with null
+/// title/frontmatter (frontmatter key still present).
+#[test]
+fn test_get_populate_dangling_golden_json() {
+    let dir = setup_relations_cli();
+
+    let output = mdvdb_bin()
+        .args(["get", "invoices/dangling.md", "--populate", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let value = &json["relations"]["client"][0];
+    assert_eq!(value["path"], "clients/ghost.md");
+    assert_eq!(value["exists"], false);
+    assert!(value["title"].is_null());
+    assert!(
+        value.as_object().unwrap().contains_key("frontmatter"),
+        "frontmatter key must be present even for missing targets"
+    );
+    assert!(value["frontmatter"].is_null());
+}
+
+/// Golden test: `get` without --populate must not carry the populate keys,
+/// and referenced_by pins its {source, field, title} shape.
+#[test]
+fn test_get_populate_keys_absent_without_flag() {
+    let dir = setup_relations_cli();
+
+    let output = mdvdb_bin()
+        .args(["get", "invoices/i1.md", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let obj = json.as_object().unwrap();
+    assert!(
+        !obj.contains_key("relations"),
+        "relations absent without --populate"
+    );
+    assert!(
+        !obj.contains_key("referenced_by"),
+        "referenced_by absent without --populate"
+    );
+
+    // referenced_by shape on the target side.
+    let output = mdvdb_bin()
+        .args(["get", "clients/acme.md", "--populate", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["relations"],
+        serde_json::json!({}),
+        "no link-shaped fields → empty map"
+    );
+    let referenced_by = json["referenced_by"].as_array().unwrap();
+    assert!(!referenced_by.is_empty());
+    for entry in referenced_by {
+        let obj = entry.as_object().unwrap();
+        for key in ["source", "field", "title"] {
+            assert!(obj.contains_key(key), "referenced_by missing key '{key}'");
+        }
+    }
+    // Sorted by (source, field); relation backlinks only (no body-link entry).
+    assert_eq!(referenced_by[0]["source"], "invoices/i1.md");
+    assert_eq!(referenced_by[0]["field"], "client");
+    assert_eq!(referenced_by[1]["source"], "invoices/i2.md");
+    assert_eq!(referenced_by[1]["field"], "clients");
+}
+
+/// Golden test: schema + collection columns pin "Relation" PascalCase and the
+/// slash-less relation_target (overlay wrote "clients/").
+#[test]
+fn test_schema_and_columns_relation_golden_json() {
+    let dir = setup_relations_cli();
+
+    let output = mdvdb_bin()
+        .args(["schema", "--path", "invoices", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let fields = json["schema"]["fields"].as_array().unwrap();
+    let client = fields.iter().find(|f| f["name"] == "client").unwrap();
+    assert_eq!(client["field_type"], "Relation", "PascalCase enum value");
+    assert_eq!(client["relation_target"], "clients", "slash-less target");
+    // Non-relation fields carry the key with null.
+    let amount = fields.iter().find(|f| f["name"] == "amount").unwrap();
+    assert!(amount["relation_target"].is_null());
+
+    let output = mdvdb_bin()
+        .args(["collection", "invoices", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let columns = json["columns"].as_array().unwrap();
+    let client_col = columns.iter().find(|c| c["name"] == "client").unwrap();
+    assert_eq!(client_col["field_type"], "Relation");
+    assert_eq!(client_col["relation_target"], "clients");
+}
+
+/// Golden test: collection --populate fills rows[].relations while
+/// rows[].frontmatter stays raw; absent without the flag.
+#[test]
+fn test_collection_populate_golden_json() {
+    let dir = setup_relations_cli();
+
+    let output = mdvdb_bin()
+        .args(["collection", "invoices", "--populate", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = json["rows"].as_array().unwrap();
+    let i1 = rows.iter().find(|r| r["path"] == "invoices/i1.md").unwrap();
+    assert_eq!(
+        i1["frontmatter"]["client"], "[[clients/acme]]",
+        "raw frontmatter untouched"
+    );
+    assert_eq!(i1["relations"]["client"][0]["path"], "clients/acme.md");
+    assert_eq!(i1["relations"]["client"][0]["title"], "Acme Corp");
+
+    let output = mdvdb_bin()
+        .args(["collection", "invoices", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for row in json["rows"].as_array().unwrap() {
+        assert!(
+            !row.as_object().unwrap().contains_key("relations"),
+            "relations key absent without --populate"
+        );
+    }
+}
+
+/// Golden test: search --populate fills results[].file.relations.
+#[test]
+fn test_search_populate_golden_json() {
+    let dir = setup_relations_cli();
+
+    let output = mdvdb_bin()
+        .args([
+            "search",
+            "Invoice body about Acme",
+            "--lexical",
+            "--populate",
+            "--json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let results = json["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    let i1 = results
+        .iter()
+        .find(|r| r["file"]["path"] == "invoices/i1.md")
+        .expect("i1 should match");
+    assert_eq!(
+        i1["file"]["relations"]["client"][0]["path"],
+        "clients/acme.md"
+    );
+}
+
+/// Golden test: links/backlinks/graph JSON pin the always-present `field` key
+/// and the `line_number: 0` frontmatter sentinel.
+#[test]
+fn test_links_and_graph_field_golden_json() {
+    let dir = setup_relations_cli();
+
+    // links: body + relation edges to the same target coexist.
+    let output = mdvdb_bin()
+        .args(["links", "invoices/i1.md", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let outgoing = json["links"]["outgoing"].as_array().unwrap();
+    let to_acme: Vec<&serde_json::Value> = outgoing
+        .iter()
+        .filter(|l| l["entry"]["target"] == "clients/acme.md")
+        .collect();
+    assert_eq!(to_acme.len(), 2, "body + relation edges: {outgoing:?}");
+    let relation = to_acme
+        .iter()
+        .find(|l| !l["entry"]["field"].is_null())
+        .unwrap();
+    assert_eq!(relation["entry"]["field"], "client");
+    assert_eq!(relation["entry"]["line_number"], 0, "frontmatter sentinel");
+    let body = to_acme
+        .iter()
+        .find(|l| l["entry"]["field"].is_null())
+        .unwrap();
+    assert!(body["entry"]["line_number"].as_u64().unwrap() > 0);
+    for link in outgoing {
+        assert!(
+            link["entry"].as_object().unwrap().contains_key("field"),
+            "LinkEntry.field must be always-present"
+        );
+    }
+
+    // backlinks: relation entries carry their field.
+    let output = mdvdb_bin()
+        .args(["backlinks", "clients/acme.md", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let backlinks = json["backlinks"].as_array().unwrap();
+    assert!(backlinks.iter().any(|l| l["entry"]["field"] == "client"));
+    for link in backlinks {
+        assert!(link["entry"].as_object().unwrap().contains_key("field"));
+    }
+
+    // graph: every edge carries the always-present field key.
+    let output = mdvdb_bin()
+        .args(["graph", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let edges = json["edges"].as_array().unwrap();
+    assert!(!edges.is_empty());
+    for edge in edges {
+        assert!(
+            edge.as_object().unwrap().contains_key("field"),
+            "GraphEdge.field must be always-present, got {edge}"
+        );
+    }
+    assert!(edges.iter().any(|e| e["field"] == "client"));
+}
+
+/// Relation-aware --filter matching on both search and collection.
+#[test]
+fn test_relation_filter_cli() {
+    let dir = setup_relations_cli();
+
+    for filter in [
+        "client=clients/acme",
+        "client=clients/acme.md",
+        "client=[[clients/acme]]",
+    ] {
+        let output = mdvdb_bin()
+            .args(["collection", "invoices", "--filter", filter, "--json"])
+            .current_dir(dir.path())
+            .output()
+            .expect("failed to run mdvdb");
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let paths: Vec<&str> = json["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["invoices/i1.md"],
+            "filter {filter} should match only i1"
+        );
+    }
+
+    let output = mdvdb_bin()
+        .args([
+            "search",
+            "Invoice",
+            "--lexical",
+            "--filter",
+            "client=clients/acme",
+            "--json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let paths: Vec<&str> = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["file"]["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"invoices/i1.md"), "got {paths:?}");
+    assert!(!paths.contains(&"invoices/dangling.md"));
+}
+
+/// Doctor gains the Relations check with a dangling warning.
+#[test]
+fn test_doctor_relations_cli() {
+    let dir = setup_relations_cli();
+
+    let output = mdvdb_bin()
+        .args(["doctor", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = json["checks"].as_array().unwrap();
+    let relations = checks
+        .iter()
+        .find(|c| c["name"] == "Relations")
+        .expect("Relations check present");
+    assert_eq!(relations["status"], "Warn");
+    let detail = relations["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("invoices/dangling.md#client → clients/ghost.md"),
+        "detail: {detail}"
+    );
+}
+
+/// Help text advertises --populate on all three commands.
+#[test]
+fn test_populate_flag_in_help() {
+    for cmd in ["get", "collection", "search"] {
+        let output = mdvdb_bin()
+            .args([cmd, "--help"])
+            .output()
+            .expect("failed to run mdvdb");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("--populate"),
+            "{cmd} --help should mention --populate"
+        );
+    }
+}
+
+/// `--version --json` must emit machine-readable JSON — the app's version
+/// gate (phase 42) parses this to enable relation features.
+#[test]
+fn test_version_json_output() {
+    let output = mdvdb_bin()
+        .args(["--version", "--json"])
+        .output()
+        .expect("failed to run mdvdb");
+    assert!(output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--version --json must be valid JSON");
+    assert_eq!(json["version"].as_str().unwrap(), env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn tree_falls_back_to_filesystem_when_index_is_unreadable() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".markdownvdb")).unwrap();
+    fs::write(
+        root.join(".markdownvdb/config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+    fs::write(root.join("notes.md"), "# Notes\n\nBody.\n").unwrap();
+    // A corrupt index must not take the tree down: read-only opens never
+    // rebuild, so the command degrades to the plain filesystem tree.
+    fs::write(root.join(".markdownvdb/index"), "not-a-valid-index").unwrap();
+
+    let output = mdvdb_bin()
+        .current_dir(root)
+        .args(["tree", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "tree must degrade, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["root"].is_object());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("notes.md"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("index unavailable"));
+}

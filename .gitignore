@@ -1,0 +1,37 @@
+.DS_Store
+
+# Auto Claude data directory
+.auto-claude/
+
+# Auto Claude generated files
+.auto-claude-security.json
+.auto-claude-status
+.claude_settings.json
+.worktrees/
+.security-key
+logs/security/
+
+# Rust build artifacts
+/target
+
+# Project artifacts
+.markdownvdb/
+.env
+.markdownvdb.index
+
+/node_modules
+/.auto-claude
+
+# Marketing Repos
+website/*
+website/tesseract
+website/tesseract/*
+
+# stuff
+/test-vault/.obsidian
+/test-vault/test
+app.zip
+
+/target
+/test-vault/
+.cargo/

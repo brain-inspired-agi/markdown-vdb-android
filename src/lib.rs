@@ -1,0 +1,5461 @@
+pub mod chunker;
+pub mod clustering;
+pub mod config;
+pub mod discovery;
+pub mod embedding;
+pub mod error;
+pub mod formula;
+pub mod frontmatter_write;
+pub mod fts;
+pub mod index;
+pub mod ingest;
+pub mod links;
+pub mod logging;
+pub mod modules;
+pub mod parser;
+pub mod path_util;
+pub mod relations;
+pub mod schema;
+pub mod search;
+pub mod shard_analysis;
+pub mod shards;
+pub mod tree;
+pub mod watcher;
+
+pub use error::Error;
+
+// Re-export key public types for convenience.
+pub use config::{Config, VectorQuantization};
+pub use index::types::{ComputedFieldDiagnostic, ComputedFieldEntry, IndexStatus};
+pub use modules::{ModuleDescriptor, ModuleDiagnostic, ModuleEvent, ModuleReport};
+pub use schema::{
+    FieldType, FormulaResultType, RelationDirection, Schema, SchemaField, ScopedSchema,
+};
+pub use search::{
+    EdgeSearchResult, GraphContextItem, MetadataFilter, SearchMode, SearchQuery, SearchResponse,
+    SearchResult, SearchResultChunk, SearchResultFile, SearchTimings, SortOrder,
+};
+pub use shard_analysis::{
+    ClusterAnalysisStatus, GraphAnalysisContext, GraphAnalysisInfo, TopicAnalysisStatus,
+};
+pub use shards::{
+    ShardDefinition, ShardInfo, ShardList, ShardMutation, ShardStore, ShardTopicMutation,
+};
+// Additional re-exports for library consumers.
+pub use clustering::{
+    ClusterInfo, ClusterState, CustomClusterDef, CustomClusterInfo, CustomClusterState,
+};
+pub use config::{
+    encode_custom_clusters as config_encode_custom_clusters,
+    parse_custom_clusters_value as config_parse_custom_clusters,
+    remove_yaml_config_value as config_remove_yaml_value,
+    update_config_value as config_update_value, update_dotenv_secret as config_update_secret,
+    update_yaml_config_value as config_update_yaml_value, write_yaml_config as config_write_yaml,
+};
+pub use links::{
+    EdgeClusterInfo, EdgeClusterState, LinkEntry, LinkGraph, LinkQueryResult, LinkState,
+    NeighborhoodNode, NeighborhoodResult, OrphanFile, ResolvedLink, SemanticEdge,
+};
+pub use parser::{FrontmatterLink, LinkContext};
+pub use relations::{ReferencedBy, RelationContext, RelationValue};
+pub use tree::{FileState, FileTree, FileTreeNode};
+pub use watcher::{WatchEventCallback, WatchEventReport, WatchEventType};
+// Graph visualization types are defined in this file and automatically public.
+// Ingest progress and preview types are defined in this file and automatically public.
+
+/// Convenience alias used throughout the crate.
+pub type Result<T> = std::result::Result<T, Error>;
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+
+use crate::embedding::provider::{create_provider, EmbeddingProvider};
+use crate::fts::FtsIndex;
+use crate::index::state::Index;
+use crate::index::storage::WriteOptions;
+use crate::index::types::EmbeddingConfig;
+
+fn resolve_dimensions_from_existing_index(root: &Path, config: &mut Config) -> Result<bool> {
+    if config.embedding_dimensions != 0 {
+        return Ok(true);
+    }
+    let index_path = root.join(".markdownvdb").join("index");
+    if !index_path.is_file() {
+        return Ok(false);
+    }
+    let write_options = WriteOptions {
+        quantization: config.vector_quantization.clone(),
+        compress_metadata: config.index_compression,
+    };
+    let index = match Index::open_with_options(&index_path, write_options) {
+        Ok(index) => index,
+        Err(Error::IndexNotFound { .. }) | Err(Error::IndexVersionMismatch { .. }) => {
+            return Ok(false)
+        }
+        Err(error) => return Err(error),
+    };
+    let stored = index.status().embedding_config;
+    // The stored geometry is also sufficient to open an incompatible index
+    // for lexical and metadata-only operations. `finish_open` compares the
+    // full embedding-space descriptor and keeps every vector operation
+    // blocked until a probed full reindex succeeds.
+    if stored.dimensions > 0 {
+        config.embedding_dimensions = stored.dimensions;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EmbeddingSpaceDescriptor {
+    provider: String,
+    model: String,
+    dimensions: usize,
+    endpoint: Option<String>,
+    options: config::EmbeddingProviderOptions,
+}
+
+impl EmbeddingSpaceDescriptor {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            provider: format!("{:?}", config.embedding_provider),
+            model: config.embedding_model.clone(),
+            dimensions: config.embedding_dimensions,
+            endpoint: semantic_endpoint_identity(config),
+            options: config.embedding_options.clone(),
+        }
+    }
+}
+
+fn semantic_endpoint_identity(config: &Config) -> Option<String> {
+    match &config.embedding_provider {
+        config::EmbeddingProviderType::Ollama => Some(config.ollama_host.clone()),
+        config::EmbeddingProviderType::AzureOpenAi => config
+            .embedding_endpoint
+            .clone()
+            .or_else(|| std::env::var("AZURE_OPENAI_ENDPOINT").ok()),
+        config::EmbeddingProviderType::HuggingFace => {
+            if config.embedding_options.huggingface.mode == "endpoint" {
+                config
+                    .embedding_options
+                    .huggingface
+                    .endpoint
+                    .clone()
+                    .or_else(|| config.embedding_endpoint.clone())
+            } else {
+                Some("https://router.huggingface.co/hf-inference".to_string())
+            }
+        }
+        config::EmbeddingProviderType::Bedrock => config
+            .embedding_options
+            .bedrock
+            .endpoint
+            .clone()
+            .or_else(|| {
+                config
+                    .embedding_options
+                    .bedrock
+                    .region
+                    .clone()
+                    .or_else(|| std::env::var("AWS_REGION").ok())
+                    .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+                    .map(|region| format!("https://bedrock-runtime.{region}.amazonaws.com"))
+            }),
+        _ => config.embedding_endpoint.clone(),
+    }
+}
+
+fn embedding_space_path(root: &Path) -> PathBuf {
+    root.join(".markdownvdb").join("embedding-space.json")
+}
+
+fn read_embedding_space(root: &Path) -> Result<Option<EmbeddingSpaceDescriptor>> {
+    let path = embedding_space_path(root);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        Error::Serialization(format!(
+            "failed to parse embedding-space descriptor '{}': {error}",
+            path.display()
+        ))
+    })
+}
+
+fn write_embedding_space(root: &Path, config: &Config) -> Result<()> {
+    use std::io::Write;
+
+    let path = embedding_space_path(root);
+    let parent = path.parent().ok_or_else(|| {
+        Error::Config("embedding-space descriptor has no parent directory".into())
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temp, &EmbeddingSpaceDescriptor::from_config(config))
+        .map_err(|error| Error::Serialization(error.to_string()))?;
+    temp.write_all(b"\n")?;
+    temp.as_file().sync_all()?;
+    temp.persist(&path)
+        .map_err(|error| Error::Io(error.error))?;
+    Ok(())
+}
+
+fn without_computed_overlay_fields(
+    mut fields: HashMap<String, schema::OverlayField>,
+) -> HashMap<String, schema::OverlayField> {
+    fields.retain(|_, field| {
+        !field
+            .field_type
+            .as_deref()
+            .and_then(schema::parse_field_type_str)
+            .is_some_and(|field_type| field_type.is_computed())
+    });
+    fields
+}
+
+/// Phase of the ingestion pipeline, reported via progress callbacks.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum IngestPhase {
+    /// Preparing the index and embedding-space probe.
+    Preparing { reindex: bool },
+    /// Probing an automatic embedding dimension before opening a generation.
+    Probing,
+    /// Discovering markdown files on disk.
+    Discovering,
+    /// Parsing a file. `current` and `total` are 1-based counts, `path` is relative.
+    Parsing {
+        current: usize,
+        total: usize,
+        path: String,
+    },
+    /// Skipping an unchanged file.
+    Skipped {
+        current: usize,
+        total: usize,
+        path: String,
+    },
+    /// A file failed during parsing or chunking; ingestion continues.
+    FileError {
+        current: usize,
+        total: usize,
+        path: String,
+        message: String,
+        error_count: usize,
+    },
+    /// Embedding a batch of chunks.
+    Embedding {
+        completed_batches: usize,
+        total_batches: usize,
+        completed_chunks: usize,
+        total_chunks: usize,
+        estimated_input_tokens: usize,
+        total_estimated_input_tokens: usize,
+        api_calls: usize,
+    },
+    /// Saving the index to disk.
+    Saving,
+    /// Running clustering.
+    Clustering,
+    /// Cleaning up removed files.
+    Cleaning,
+    /// Cancellation was observed at a safe boundary.
+    Cancelled,
+    /// Ingestion complete.
+    Done,
+}
+
+/// Callback invoked to report ingestion progress.
+pub type ProgressCallback = Box<dyn Fn(&IngestPhase) + Send + Sync>;
+
+/// Status of a file in an ingest preview.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub enum PreviewFileStatus {
+    /// File is new (not yet indexed).
+    New,
+    /// File has changed since last index.
+    Changed,
+    /// File is unchanged.
+    Unchanged,
+}
+
+/// Information about a single file in an ingest preview.
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewFileInfo {
+    /// Relative path to the file.
+    pub path: String,
+    /// Whether the file is new, changed, or unchanged.
+    pub status: PreviewFileStatus,
+    /// Number of chunks this file would produce.
+    pub chunks: usize,
+    /// Estimated token count for embedding.
+    pub estimated_tokens: usize,
+}
+
+/// Preview of what an ingestion would do, without actually doing it.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestPreview {
+    /// Per-file details.
+    pub files: Vec<PreviewFileInfo>,
+    /// Total number of files discovered.
+    pub total_files: usize,
+    /// Number of files that need processing (new + changed).
+    pub files_to_process: usize,
+    /// Number of files that are unchanged.
+    pub files_unchanged: usize,
+    /// Total chunks across all files to process.
+    pub total_chunks: usize,
+    /// Estimated total tokens for embedding.
+    pub estimated_tokens: usize,
+    /// Estimated number of API calls.
+    pub estimated_api_calls: usize,
+}
+
+fn build_ingest_preview(
+    root: &Path,
+    config: &Config,
+    existing_hashes: &HashMap<String, String>,
+    reindex: bool,
+    file: Option<PathBuf>,
+) -> Result<IngestPreview> {
+    let disco = discovery::FileDiscovery::new(root, config);
+    let discovered = if let Some(ref single_file) = file {
+        let full = root.join(single_file);
+        if !full.is_file() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("file not found: {}", single_file.display()),
+            )));
+        }
+        vec![single_file.clone()]
+    } else {
+        disco.discover()?
+    };
+
+    let mut files = Vec::new();
+    let mut total_chunks = 0;
+    let mut estimated_tokens = 0;
+    let mut files_to_process = 0;
+    let mut files_unchanged = 0;
+
+    for path in &discovered {
+        let path_str = path_util::to_slash(path);
+        let md = match parser::parse_markdown_file(root, path) {
+            Ok(md) => md,
+            Err(error) => {
+                warn!(path = %path.display(), %error, "failed to parse during preview");
+                continue;
+            }
+        };
+        let status = if reindex {
+            PreviewFileStatus::Changed
+        } else if let Some(existing) = existing_hashes.get(&path_str) {
+            if *existing == md.content_hash {
+                PreviewFileStatus::Unchanged
+            } else {
+                PreviewFileStatus::Changed
+            }
+        } else {
+            PreviewFileStatus::New
+        };
+        let chunks = match chunker::chunk_document(
+            &md,
+            config.chunk_max_tokens,
+            config.chunk_overlap_tokens,
+        ) {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                warn!(path = %path.display(), %error, "failed to chunk during preview");
+                continue;
+            }
+        };
+        let chunk_count = chunks.len();
+        let file_tokens = chunks
+            .iter()
+            .map(|chunk| chunker::count_tokens(&chunk.content))
+            .sum();
+
+        if status == PreviewFileStatus::Unchanged {
+            files_unchanged += 1;
+        } else {
+            files_to_process += 1;
+            total_chunks += chunk_count;
+            estimated_tokens += file_tokens;
+        }
+        files.push(PreviewFileInfo {
+            path: path_str,
+            status,
+            chunks: chunk_count,
+            estimated_tokens: file_tokens,
+        });
+    }
+
+    let batch_size = config.embedding_batch_size.max(1);
+    let estimated_api_calls = total_chunks.div_ceil(batch_size);
+    Ok(IngestPreview {
+        files,
+        total_files: discovered.len(),
+        files_to_process,
+        files_unchanged,
+        total_chunks,
+        estimated_tokens,
+        estimated_api_calls,
+    })
+}
+
+/// Sync-state breakdown of on-disk files vs the index within a scope.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct SyncBreakdown {
+    /// Files on disk that are not yet indexed.
+    pub new: usize,
+    /// Files on disk whose content differs from the indexed version.
+    pub changed: usize,
+    /// Files on disk that match the indexed version.
+    pub unchanged: usize,
+    /// Files in the index that no longer exist on disk.
+    pub deleted: usize,
+}
+
+/// Stats snapshot for the whole vault or a folder scope, returned by
+/// [`MarkdownVdb::info`] and the `mdvdb info` CLI command.
+#[derive(Debug, Clone, Serialize)]
+pub struct VaultInfo {
+    /// Normalized scope: `"."` for the whole vault, else a `"folder/"` prefix.
+    pub scope: String,
+    /// Whether the scope covers the whole vault.
+    pub is_whole_vault: bool,
+    /// Markdown files discovered on disk within the scope.
+    pub file_count: usize,
+    /// Files currently in the index within the scope.
+    pub indexed_file_count: usize,
+    /// Chunks in the index within the scope.
+    pub chunk_count: usize,
+    /// Vectors within the scope. Whole-vault: measured HNSW size; scoped:
+    /// derived as `chunk_count + edge_count` (HNSW has no per-path structure).
+    pub vector_count: usize,
+    /// Edge vectors attributed to in-scope source files.
+    pub edge_count: usize,
+    /// Chunks a full reindex of this scope would produce (computed from disk).
+    pub reindex_chunks: usize,
+    /// Estimated tokens to embed for a full reindex of this scope.
+    pub reindex_estimated_tokens: usize,
+    /// Estimated embedding API calls for a full reindex of this scope.
+    pub reindex_estimated_api_calls: usize,
+    /// Index file size on disk in bytes (whole index file — never scoped).
+    pub index_file_size: u64,
+    /// Embedding provider/model/dimensions snapshot from the index.
+    pub embedding: index::types::EmbeddingConfig,
+    /// Sync-state breakdown of disk files vs the index.
+    pub sync: SyncBreakdown,
+    /// Unix timestamp of the last index save (whole index).
+    pub last_updated: u64,
+}
+
+/// Options controlling the ingestion pipeline.
+#[derive(Default)]
+pub struct IngestOptions {
+    /// Force re-embedding of all files, ignoring content hashes.
+    pub full: bool,
+    /// Ingest only a single file (relative path).
+    pub file: Option<PathBuf>,
+    /// Optional progress callback invoked during ingestion.
+    pub progress: Option<ProgressCallback>,
+    /// Optional cancellation token to abort ingestion early.
+    pub cancel: Option<CancellationToken>,
+}
+
+impl std::fmt::Debug for IngestOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IngestOptions")
+            .field("full", &self.full)
+            .field("file", &self.file)
+            .field("progress", &self.progress.as_ref().map(|_| "..."))
+            .field("cancel", &self.cancel)
+            .finish()
+    }
+}
+
+/// Per-phase timing breakdown for ingestion operations.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestTimings {
+    /// Time spent discovering markdown files.
+    pub discover_secs: f64,
+    /// Time spent parsing files, computing hashes, and chunking.
+    pub parse_secs: f64,
+    /// Time spent calling the embedding provider API.
+    pub embed_secs: f64,
+    /// Time spent upserting chunks into the vector index and FTS.
+    pub upsert_secs: f64,
+    /// Time spent saving the index to disk and committing FTS.
+    pub save_secs: f64,
+    /// Total wall-clock time (equals duration_secs).
+    pub total_secs: f64,
+}
+
+/// Result of an ingestion operation.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestResult {
+    /// Number of files indexed (new or changed).
+    pub files_indexed: usize,
+    /// Number of files skipped (unchanged).
+    pub files_skipped: usize,
+    /// Number of files removed from index (deleted from disk).
+    pub files_removed: usize,
+    /// Number of chunks created.
+    pub chunks_created: usize,
+    /// Number of API calls made to the embedding provider.
+    pub api_calls: usize,
+    /// Provider-independent local count of inputs successfully embedded.
+    pub estimated_input_tokens: usize,
+    /// Number of files that failed to ingest.
+    pub files_failed: usize,
+    /// Errors encountered during ingestion.
+    pub errors: Vec<IngestError>,
+    /// Reports from always-on derived-data modules.
+    pub module_reports: Vec<modules::ModuleReport>,
+    /// Wall-clock duration of the ingestion in seconds.
+    pub duration_secs: f64,
+    /// Per-phase timing breakdown (always populated; CLI decides whether to display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<IngestTimings>,
+    /// Whether the ingestion was cancelled before completion.
+    pub cancelled: bool,
+}
+
+/// A single ingestion error for a specific file.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestError {
+    /// Path to the file that failed.
+    pub path: String,
+    /// Error message.
+    pub message: String,
+}
+
+/// Information about an indexed document.
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentInfo {
+    /// Relative path to the markdown file.
+    pub path: String,
+    /// SHA-256 content hash.
+    pub content_hash: String,
+    /// Frontmatter metadata, if present.
+    pub frontmatter: Option<serde_json::Value>,
+    /// Successful computed values mirrored for module provenance/diagnostics.
+    /// `frontmatter` is the authoritative materialized source.
+    pub computed_fields: serde_json::Map<String, serde_json::Value>,
+    /// Calculation errors keyed by computed field name.
+    pub computed_field_errors: std::collections::BTreeMap<String, ComputedFieldDiagnostic>,
+    /// Number of chunks for this document.
+    pub chunk_count: usize,
+    /// File size in bytes.
+    pub file_size: u64,
+    /// Unix timestamp when indexed.
+    pub indexed_at: u64,
+    /// Filesystem modification time as Unix timestamp, if available.
+    pub modified_at: Option<u64>,
+    /// Resolved frontmatter relations, keyed by field name (alphabetical).
+    /// Present iff populate was requested (`{}` when empty, key absent otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relations: Option<std::collections::BTreeMap<String, Vec<relations::RelationValue>>>,
+    /// Reverse relation lookups (documents referencing this one via frontmatter),
+    /// sorted by `(source, field)`. Present iff populate was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referenced_by: Option<Vec<relations::ReferencedBy>>,
+}
+
+/// How a collection row's title was derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TitleSource {
+    /// From the frontmatter `title` field.
+    Frontmatter,
+    /// From the filename stem (no usable frontmatter title).
+    Filename,
+}
+
+/// Query options for [`MarkdownVdb::collection`].
+#[derive(Debug, Clone, Default)]
+pub struct CollectionQuery {
+    /// Folder path prefix (relative to project root). "" or "." means the whole vault.
+    pub path: String,
+    /// If true, include files in all nested subfolders. If false, only direct children.
+    pub recursive: bool,
+    /// Frontmatter field name to sort rows by. None = sort by path ascending.
+    pub sort_by: Option<String>,
+    /// Sort direction.
+    pub order: SortOrder,
+    /// Metadata filters (AND logic), reusing the search engine's `MetadataFilter`.
+    pub filters: Vec<MetadataFilter>,
+    /// Max rows to return after filtering+sorting. None = all rows.
+    pub limit: Option<usize>,
+    /// Number of rows to skip (for pagination).
+    pub offset: usize,
+    /// Resolve frontmatter relations on the returned page rows (depth 1).
+    pub populate: bool,
+}
+
+/// Top-level response for [`MarkdownVdb::collection`]: columns + the paginated
+/// page of rows + total count.
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectionResponse {
+    /// The resolved scope prefix (normalized, e.g. "blog/"; "." for whole vault).
+    pub scope: String,
+    /// Whether nested subfolders were included.
+    pub recursive: bool,
+    /// Column definitions (scoped schema fields ∪ present-but-unscoped frontmatter keys).
+    pub columns: Vec<CollectionColumn>,
+    /// The page of rows after filtering, sorting, and limit/offset.
+    pub rows: Vec<CollectionRow>,
+    /// Total rows after filtering, BEFORE limit/offset (for pagination UIs).
+    pub total_rows: usize,
+    /// Echo of the applied limit (key omitted from JSON if None).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Echo of the applied offset.
+    pub offset: usize,
+}
+
+/// One table column. Derived from the scoped `Schema`'s `SchemaField`, plus `in_schema`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectionColumn {
+    /// Frontmatter key / column name. (NOT "key" — matches `SchemaField.name`.)
+    pub name: String,
+    /// Inferred or overlay-declared type. Reuses `schema::FieldType` (PascalCase JSON).
+    pub field_type: schema::FieldType,
+    /// Human-readable description from overlay, if any.
+    pub description: Option<String>,
+    /// Number of files (in this scope) that have this field. 0 for present-but-unscoped keys.
+    pub occurrence_count: usize,
+    /// Up to 20 sample values from the schema (empty for present-but-unscoped keys).
+    pub sample_values: Vec<String>,
+    /// Allowed values from overlay, if declared (usually None).
+    pub allowed_values: Option<Vec<String>>,
+    /// Whether the field is marked required in the overlay.
+    pub required: bool,
+    /// True if the column came from the scoped `Schema`; false if it was discovered
+    /// only because a returned row's frontmatter contained the key.
+    pub in_schema: bool,
+    /// Overlay-declared FK target folder for relation columns (slash-less).
+    /// Always-present JSON key (`null` when unscoped), mirroring `SchemaField`.
+    pub relation_target: Option<String>,
+    /// Formula source for Formula/Rollup columns; `null` otherwise.
+    pub formula: Option<String>,
+    /// Declared output type for Formula/Rollup columns.
+    pub result_type: Option<schema::FormulaResultType>,
+    /// Relation field selected by Lookup/Rollup columns.
+    pub relation_field: Option<String>,
+    /// Exact target frontmatter key selected by Lookup/Rollup columns.
+    pub target_field: Option<String>,
+    /// Effective traversal direction for Lookup/Rollup columns.
+    pub relation_direction: Option<schema::RelationDirection>,
+    /// Incoming Rollup source scope; `null` for outgoing computed fields.
+    pub relation_scope: Option<String>,
+}
+
+/// One table row = one Markdown document.
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectionRow {
+    /// Relative path (project-root-relative, forward slashes). Stable row id.
+    pub path: String,
+    /// Derived display title (frontmatter.title -> filename stem). Never empty.
+    pub title: String,
+    /// How the title was derived.
+    pub title_source: TitleSource,
+    /// Full frontmatter as a JSON object. Always an object (`{}` if none), never null.
+    pub frontmatter: serde_json::Value,
+    /// Successful computed values mirrored for module provenance/diagnostics.
+    /// `frontmatter` is the authoritative materialized source.
+    pub computed_fields: serde_json::Map<String, serde_json::Value>,
+    /// Calculation errors keyed by computed field name.
+    pub computed_field_errors: std::collections::BTreeMap<String, ComputedFieldDiagnostic>,
+    /// SHA-256 content hash from the index. None for files not in the index (state == New).
+    pub content_hash: Option<String>,
+    /// File size in bytes.
+    pub file_size: u64,
+    /// Filesystem modification time (Unix seconds), if known.
+    pub modified_at: Option<u64>,
+    /// When this file was last indexed (Unix seconds). None for state == New.
+    pub indexed_at: Option<u64>,
+    /// Sync state relative to the index.
+    pub state: tree::FileState,
+    /// Resolved frontmatter relations (populate only; key absent otherwise).
+    /// `rows[].frontmatter` stays the raw object — populate never mutates it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relations: Option<std::collections::BTreeMap<String, Vec<relations::RelationValue>>>,
+}
+
+/// Result of a doctor diagnostic check.
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorResult {
+    /// Individual diagnostic checks.
+    pub checks: Vec<DoctorCheck>,
+    /// Number of checks that passed.
+    pub passed: usize,
+    /// Total number of checks.
+    pub total: usize,
+}
+
+/// A single diagnostic check.
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorCheck {
+    /// Human-readable name of the check.
+    pub name: String,
+    /// Pass, Fail, or Warn.
+    pub status: CheckStatus,
+    /// Detail message describing the result.
+    pub detail: String,
+}
+
+/// Status of a diagnostic check.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub enum CheckStatus {
+    Pass,
+    Fail,
+    Warn,
+}
+
+/// Summary of a cluster.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterSummary {
+    /// Cluster identifier — stable across re-clustering, not contiguous.
+    pub id: usize,
+    /// Number of documents in this cluster.
+    pub document_count: usize,
+    /// Representative keywords or label.
+    pub label: Option<String>,
+    /// Top keywords extracted via TF-IDF.
+    pub keywords: Vec<String>,
+    /// Parent cluster id when a hierarchy level exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<usize>,
+    /// The member document closest to the cluster centroid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub representative: Option<String>,
+}
+
+/// Summary of a user-defined topic (custom cluster).
+#[derive(Debug, Clone, Serialize)]
+pub struct CustomClusterSummary {
+    /// Cluster identifier.
+    pub id: usize,
+    /// User-provided topic name.
+    pub name: String,
+    /// User-provided description, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Seed phrases used to define this topic.
+    pub seed_phrases: Vec<String>,
+    /// Per-topic similarity threshold override, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
+    /// Number of documents assigned to this topic.
+    pub document_count: usize,
+    /// Mean similarity score of the members, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_score: Option<f32>,
+}
+
+/// Graph detail level: document (file) or chunk.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, clap::ValueEnum)]
+pub enum GraphLevel {
+    /// One node per file (default).
+    #[default]
+    Document,
+    /// One node per chunk within each file.
+    Chunk,
+}
+
+/// A node in the graph visualization representing an indexed file or chunk.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphNode {
+    /// Unique identifier for this node (file path or chunk id).
+    pub id: String,
+    /// Relative file path.
+    pub path: String,
+    /// Display label (e.g. heading text for chunks).
+    pub label: Option<String>,
+    /// Chunk index within the file, if this is a chunk-level node.
+    pub chunk_index: Option<usize>,
+    /// Cluster assignment, if any.
+    pub cluster_id: Option<usize>,
+    /// Primary topic assignment (highest score), if any; `None` = Unassigned.
+    pub custom_cluster_id: Option<usize>,
+    /// All topic memberships (multi-label), sorted by score descending.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub custom_cluster_ids: Vec<usize>,
+    /// Similarity scores parallel to `custom_cluster_ids`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub custom_cluster_scores: Vec<f32>,
+    /// Optional size metric for visualization (e.g. content length for chunks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
+}
+
+/// An edge in the graph visualization representing a link or similarity.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphEdge {
+    /// Source node id.
+    pub source: String,
+    /// Target node id.
+    pub target: String,
+    /// Optional edge weight (e.g. cosine similarity).
+    pub weight: Option<f64>,
+    /// Semantic edge relationship type (cluster label).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship_type: Option<String>,
+    /// Semantic edge strength (cosine similarity between edge and target embeddings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strength: Option<f64>,
+    /// Paragraph context surrounding the link.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_text: Option<String>,
+    /// Edge cluster assignment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_cluster_id: Option<usize>,
+    /// Originating frontmatter field for relation edges; `None` for body and
+    /// similarity edges. Deliberately NOT skip-serialized (unlike the other
+    /// options on this struct): the contract requires an always-present
+    /// `"field": null` key that the app mirrors as required.
+    pub field: Option<String>,
+}
+
+/// A cluster in the graph visualization.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphCluster {
+    /// Cluster identifier.
+    pub id: usize,
+    /// Auto-generated label from top keywords.
+    pub label: String,
+    /// Cross-cluster TF-IDF keywords.
+    pub keywords: Vec<String>,
+    /// Number of members in this cluster.
+    pub member_count: usize,
+    /// Topic description (custom clusters only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Per-topic threshold override (custom clusters only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
+    /// Parent cluster id (auto clusters with a hierarchy level only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<usize>,
+}
+
+/// Complete graph data combining nodes, edges, and clusters.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphData {
+    /// All indexed files as graph nodes.
+    pub nodes: Vec<GraphNode>,
+    /// Markdown link connections between files.
+    pub edges: Vec<GraphEdge>,
+    /// Cluster groupings with labels.
+    pub clusters: Vec<GraphCluster>,
+    /// The level of detail for this graph.
+    pub level: String,
+    /// Edge clusters (semantic relationship groupings), if available.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub edge_clusters: Vec<GraphCluster>,
+    /// User-defined custom clusters, if available.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub custom_clusters: Vec<GraphCluster>,
+    /// Analysis source and readiness for Shard-native graph responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<GraphAnalysisInfo>,
+}
+
+/// Wire-efficient graph response for visualization clients.
+///
+/// Unlike [`GraphData`], edge contexts are interned once in [`contexts`](Self::contexts)
+/// and referenced by [`CompactGraphEdge::context_index`]. This preserves every
+/// full context while avoiding repeated strings in the serialized response.
+/// Consumers should reject unsupported [`version`](Self::version) values before
+/// interpreting the rest of the payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactGraphData {
+    /// Stable discriminator for this response shape.
+    pub format: String,
+    /// Version of the compact graph wire contract.
+    pub version: u32,
+    /// All indexed files or chunks as graph nodes.
+    pub nodes: Vec<GraphNode>,
+    /// Graph connections whose contexts reference `contexts` by index.
+    pub edges: Vec<CompactGraphEdge>,
+    /// Deduplicated, full edge contexts. Indices are zero-based.
+    pub contexts: Vec<String>,
+    /// Cluster groupings with labels.
+    pub clusters: Vec<GraphCluster>,
+    /// The level of detail for this graph.
+    pub level: String,
+    /// Edge clusters (semantic relationship groupings), if available.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub edge_clusters: Vec<GraphCluster>,
+    /// User-defined custom clusters, if available.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub custom_clusters: Vec<GraphCluster>,
+    /// Analysis source and readiness for Shard-native graph responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<GraphAnalysisInfo>,
+}
+
+/// An edge in the compact graph wire contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactGraphEdge {
+    /// Source node id.
+    pub source: String,
+    /// Target node id.
+    pub target: String,
+    /// Optional edge weight (e.g. cosine similarity).
+    pub weight: Option<f64>,
+    /// Semantic edge relationship type (cluster label).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship_type: Option<String>,
+    /// Semantic edge strength (cosine similarity between edge and target embeddings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strength: Option<f64>,
+    /// Index into [`CompactGraphData::contexts`] for the full paragraph context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_index: Option<usize>,
+    /// Edge cluster assignment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_cluster_id: Option<usize>,
+    /// Originating frontmatter field for relation edges. Always serialized so
+    /// this remains compatible with the required edge-field contract.
+    pub field: Option<String>,
+}
+
+/// Stable format discriminator for [`CompactGraphData`].
+pub const COMPACT_GRAPH_FORMAT: &str = "mdvdb.graph.compact";
+/// Current [`CompactGraphData`] wire-contract version.
+pub const COMPACT_GRAPH_VERSION: u32 = 1;
+
+impl From<GraphData> for CompactGraphData {
+    fn from(data: GraphData) -> Self {
+        let GraphData {
+            nodes,
+            edges,
+            clusters,
+            level,
+            edge_clusters,
+            custom_clusters,
+            analysis,
+        } = data;
+
+        // Own each unique context exactly once while building the index. Move
+        // the map keys into index order after all edges have been converted.
+        let mut context_indices: HashMap<String, usize> = HashMap::new();
+        let edges = edges
+            .into_iter()
+            .map(|edge| {
+                let context_index = edge.context_text.map(|context| {
+                    if let Some(index) = context_indices.get(&context) {
+                        *index
+                    } else {
+                        let index = context_indices.len();
+                        context_indices.insert(context, index);
+                        index
+                    }
+                });
+                CompactGraphEdge {
+                    source: edge.source,
+                    target: edge.target,
+                    weight: edge.weight,
+                    relationship_type: edge.relationship_type,
+                    strength: edge.strength,
+                    context_index,
+                    edge_cluster_id: edge.edge_cluster_id,
+                    field: edge.field,
+                }
+            })
+            .collect();
+
+        let mut contexts = vec![String::new(); context_indices.len()];
+        for (context, index) in context_indices {
+            contexts[index] = context;
+        }
+
+        Self {
+            format: COMPACT_GRAPH_FORMAT.to_string(),
+            version: COMPACT_GRAPH_VERSION,
+            nodes,
+            edges,
+            contexts,
+            clusters,
+            level,
+            edge_clusters,
+            custom_clusters,
+            analysis,
+        }
+    }
+}
+
+struct DocumentGraphScaffold {
+    indexed_paths: HashSet<String>,
+    nodes: Vec<GraphNode>,
+    clusters: Vec<GraphCluster>,
+    custom_clusters: Vec<GraphCluster>,
+}
+
+impl DocumentGraphScaffold {
+    fn empty() -> Self {
+        Self {
+            indexed_paths: HashSet::new(),
+            nodes: Vec::new(),
+            clusters: Vec::new(),
+            custom_clusters: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ShardDerivedAnalysis {
+    shard: ShardInfo,
+    clusters: Option<clustering::ClusterState>,
+    topics: Option<clustering::CustomClusterState>,
+    info: GraphAnalysisInfo,
+}
+
+fn cluster_summaries(state: Option<&clustering::ClusterState>) -> Vec<ClusterSummary> {
+    state
+        .map(|state| {
+            state
+                .clusters
+                .iter()
+                .map(|cluster| ClusterSummary {
+                    id: cluster.id,
+                    document_count: cluster.members.len(),
+                    label: (!cluster.label.is_empty()).then(|| cluster.label.clone()),
+                    keywords: cluster.keywords.clone(),
+                    parent_id: cluster.parent_id,
+                    representative: cluster.representative.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn custom_cluster_summaries(
+    state: Option<&clustering::CustomClusterState>,
+) -> Vec<CustomClusterSummary> {
+    state
+        .map(|state| {
+            state
+                .clusters
+                .iter()
+                .map(|cluster| CustomClusterSummary {
+                    id: cluster.id,
+                    name: cluster.name.clone(),
+                    description: cluster.description.clone(),
+                    seed_phrases: cluster.seed_phrases.clone(),
+                    threshold: cluster.threshold,
+                    document_count: cluster.members.len(),
+                    mean_score: (!cluster.members.is_empty()).then(|| {
+                        cluster
+                            .members
+                            .iter()
+                            .map(|member| member.score)
+                            .sum::<f32>()
+                            / cluster.members.len() as f32
+                    }),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn topic_centroids_if_compatible(
+    state: &clustering::CustomClusterState,
+    definitions: &[clustering::CustomClusterDef],
+    fingerprint: &str,
+    dimensions: usize,
+) -> Option<Vec<Vec<f32>>> {
+    if state.fingerprint != fingerprint || state.clusters.len() != definitions.len() {
+        return None;
+    }
+    state
+        .clusters
+        .iter()
+        .zip(definitions)
+        .all(|(cluster, definition)| {
+            cluster.name == definition.name && cluster.centroid.len() == dimensions
+        })
+        .then(|| {
+            state
+                .clusters
+                .iter()
+                .map(|cluster| cluster.centroid.clone())
+                .collect()
+        })
+}
+
+fn shard_visible_scope(shard_path: &str, visible_path: Option<&str>) -> Option<String> {
+    let Some(visible_path) = visible_path else {
+        return Some(shard_path.to_string());
+    };
+    let visible_path = path_util::normalize_path_input(visible_path);
+    if path_util::path_is_in_scope(&visible_path, shard_path) {
+        Some(visible_path.trim_end_matches('/').to_string())
+    } else if path_util::path_is_in_scope(shard_path, &visible_path) {
+        Some(shard_path.to_string())
+    } else {
+        None
+    }
+}
+
+/// Map each document path to its topic memberships `(id, score)`, sorted by
+/// score descending (ties → lower id). The first entry is the primary topic.
+fn topic_membership_map(
+    state: Option<&clustering::CustomClusterState>,
+) -> HashMap<String, Vec<(usize, f32)>> {
+    let mut map: HashMap<String, Vec<(usize, f32)>> = HashMap::new();
+    if let Some(state) = state {
+        for cluster in &state.clusters {
+            for member in &cluster.members {
+                map.entry(member.path.clone())
+                    .or_default()
+                    .push((cluster.id, member.score));
+            }
+        }
+    }
+    for memberships in map.values_mut() {
+        memberships.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+    map
+}
+
+/// Convert an auto cluster to its graph representation.
+fn graph_cluster_from_auto(cluster: &clustering::ClusterInfo) -> GraphCluster {
+    GraphCluster {
+        id: cluster.id,
+        label: cluster.label.clone(),
+        keywords: cluster.keywords.clone(),
+        member_count: cluster.members.len(),
+        description: None,
+        threshold: None,
+        parent_id: cluster.parent_id,
+    }
+}
+
+fn graph_cluster_from_auto_visible(
+    cluster: &clustering::ClusterInfo,
+    visible_paths: &HashSet<String>,
+) -> Option<GraphCluster> {
+    let member_count = cluster
+        .members
+        .iter()
+        .filter(|path| visible_paths.contains(*path))
+        .count();
+    (member_count > 0).then(|| GraphCluster {
+        member_count,
+        ..graph_cluster_from_auto(cluster)
+    })
+}
+
+/// Convert a topic (custom cluster) to its graph representation.
+fn graph_cluster_from_topic(cluster: &clustering::CustomClusterInfo) -> GraphCluster {
+    GraphCluster {
+        id: cluster.id,
+        label: cluster.name.clone(),
+        keywords: cluster.seed_phrases.clone(),
+        member_count: cluster.members.len(),
+        description: cluster.description.clone(),
+        threshold: cluster.threshold,
+        parent_id: None,
+    }
+}
+
+fn graph_cluster_from_topic_visible(
+    cluster: &clustering::CustomClusterInfo,
+    visible_paths: &HashSet<String>,
+) -> Option<GraphCluster> {
+    let member_count = cluster
+        .members
+        .iter()
+        .filter(|member| visible_paths.contains(&member.path))
+        .count();
+    (member_count > 0).then(|| GraphCluster {
+        member_count,
+        ..graph_cluster_from_topic(cluster)
+    })
+}
+
+fn graph_edge_clusters(
+    link_graph: Option<&links::LinkGraph>,
+    visible_edge_ids: &HashSet<String>,
+) -> Vec<GraphCluster> {
+    link_graph
+        .and_then(|graph| graph.edge_cluster_state.as_ref())
+        .map(|state| {
+            state
+                .clusters
+                .iter()
+                .filter_map(|cluster| {
+                    let member_count = cluster
+                        .members
+                        .iter()
+                        .filter(|edge_id| visible_edge_ids.contains(*edge_id))
+                        .count();
+                    (member_count > 0).then(|| GraphCluster {
+                        id: cluster.id,
+                        label: cluster.label.clone(),
+                        keywords: cluster.keywords.clone(),
+                        member_count,
+                        description: None,
+                        threshold: None,
+                        parent_id: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Primary library API handle for markdown-vdb.
+pub struct MarkdownVdb {
+    /// Canonicalized project root directory.
+    root: PathBuf,
+    /// Loaded configuration.
+    config: Config,
+    /// Embedding provider instance, lazily initialized on first use.
+    /// Commands like `tree` and `status` never need embeddings,
+    /// so we defer creation to avoid requiring API keys for read-only ops.
+    provider: Mutex<Option<Arc<dyn EmbeddingProvider>>>,
+    /// Vector index (Arc for sharing with watcher).
+    index: Arc<Index>,
+    /// Full-text search index (Arc for sharing with watcher).
+    fts_index: Arc<FtsIndex>,
+    /// True when this read-only instance opened while a vector/FTS
+    /// reconciliation marker was pending. Lexical state may describe an older
+    /// generation, so FTS-dependent queries fail; everything else (tree, get,
+    /// links, semantic search) keeps working. Writable opens repair the split
+    /// during construction and never set this.
+    fts_pending_reconcile: bool,
+    /// True when an incompatible archived layout was safely recreated and a
+    /// collection-wide ingest is still required before scoped mutations.
+    index_rebuilt: AtomicBool,
+    /// False when provider/model/dimensions differ from the stored vector
+    /// space. Lexical operations remain available; vector operations require
+    /// a full reindex.
+    embedding_compatible: AtomicBool,
+}
+
+impl MarkdownVdb {
+    /// Open a markdown-vdb instance rooted at the given directory.
+    ///
+    /// Loads config from `.markdownvdb`, creates the embedding provider,
+    /// and opens or creates the index file.
+    pub fn open(root: &Path) -> Result<Self> {
+        let root = root.canonicalize().map_err(|e| {
+            Error::Config(format!(
+                "cannot canonicalize root '{}': {e}",
+                root.display()
+            ))
+        })?;
+
+        let config = Config::load(&root)?;
+        Self::open_with_config(root, config)
+    }
+
+    /// Async constructor that resolves `dimensions: auto` with one provider
+    /// probe when no compatible index can supply the dimension.
+    pub async fn open_async(root: &Path) -> Result<Self> {
+        let root = root.canonicalize().map_err(|e| {
+            Error::Config(format!(
+                "cannot canonicalize root '{}': {e}",
+                root.display()
+            ))
+        })?;
+        let config = Config::load(&root)?;
+        Self::open_async_with_config(root, config).await
+    }
+
+    pub async fn open_async_with_config(root: PathBuf, mut config: Config) -> Result<Self> {
+        if config.embedding_dimensions == 0
+            && !resolve_dimensions_from_existing_index(&root, &mut config)?
+        {
+            let provider = create_provider(&config)?;
+            let probe = embedding::provider::probe_provider(provider.as_ref()).await?;
+            config.embedding_dimensions = probe.dimensions;
+        }
+        Self::open_with_config(root, config)
+    }
+
+    /// Open for an explicit full reindex. Unlike the ordinary async open,
+    /// `dimensions: auto` is always probed so a mutable provider alias can
+    /// resolve to a different embedding size before any index generation is
+    /// changed.
+    pub async fn open_async_for_reindex_with_config(
+        root: PathBuf,
+        mut config: Config,
+    ) -> Result<Self> {
+        if config.embedding_dimensions == 0 {
+            let provider = create_provider(&config)?;
+            let probe = embedding::provider::probe_provider(provider.as_ref()).await?;
+            config.embedding_dimensions = probe.dimensions;
+        }
+        Self::open_with_config(root, config)
+    }
+
+    /// Open a markdown-vdb instance with an explicit configuration.
+    ///
+    /// Useful for testing or when configuration is constructed programmatically.
+    pub fn open_with_config(root: PathBuf, mut config: Config) -> Result<Self> {
+        let root = if root.is_relative() {
+            root.canonicalize().map_err(|e| {
+                Error::Config(format!(
+                    "cannot canonicalize root '{}': {e}",
+                    root.display()
+                ))
+            })?
+        } else {
+            root
+        };
+
+        if config.embedding_dimensions == 0
+            && !resolve_dimensions_from_existing_index(&root, &mut config)?
+        {
+            return Err(Error::Config(
+                "embedding dimensions are set to auto and no compatible index exists; use MarkdownVdb::open_async or `mdvdb embedding probe`"
+                    .into(),
+            ));
+        }
+
+        let embedding_config = EmbeddingConfig {
+            provider: format!("{:?}", config.embedding_provider),
+            model: config.embedding_model.clone(),
+            dimensions: config.embedding_dimensions,
+        };
+
+        // Ensure the unified .markdownvdb directory exists.
+        // If it's a legacy flat config file, migrate it first.
+        let index_dir = root.join(".markdownvdb");
+        if index_dir.is_file() {
+            // Legacy: .markdownvdb was a flat config file. Move it aside,
+            // create the directory, then move the config inside as .config.
+            let tmp_config = root.join(".markdownvdb.migrating");
+            std::fs::rename(&index_dir, &tmp_config)?;
+            std::fs::create_dir_all(&index_dir)?;
+            std::fs::rename(&tmp_config, index_dir.join(".config"))?;
+            info!("migrated legacy .markdownvdb config file → .markdownvdb/.config");
+        } else if !index_dir.exists() {
+            std::fs::create_dir_all(&index_dir)?;
+        }
+
+        // Auto-migrate from old split layout (.markdownvdb.index file + .markdownvdb.fts/ dir).
+        let legacy_index_file = root.join(".markdownvdb.index");
+        let legacy_fts_dir = root.join(".markdownvdb.fts");
+        if legacy_index_file.is_file() && !index_dir.join("index").exists() {
+            info!("migrating legacy .markdownvdb.index → .markdownvdb/index");
+            std::fs::rename(&legacy_index_file, index_dir.join("index"))?;
+        }
+        if legacy_fts_dir.is_dir() && !index_dir.join("fts").exists() {
+            info!("migrating legacy .markdownvdb.fts/ → .markdownvdb/fts/");
+            std::fs::rename(&legacy_fts_dir, index_dir.join("fts"))?;
+        }
+
+        let index_path = index_dir.join("index");
+        let write_options = WriteOptions {
+            quantization: config.vector_quantization.clone(),
+            compress_metadata: config.index_compression,
+        };
+        let fts_path = index_dir.join("fts");
+        // Take the long-lived FTS writer before the project transaction lock,
+        // matching watcher event ordering. If Tantivy itself must be created,
+        // record the split before that companion-store mutation as well.
+        if !fts_path.join("meta.json").is_file() {
+            fts::begin_reconciliation(&root)?;
+        }
+        let fts_index = Arc::new(FtsIndex::open_or_create(&fts_path)?);
+        let (index, rebuilt_index) = {
+            // Serialize inspection and any replacement of the vector
+            // generation. The hook is invoked before an incompatible archive
+            // is removed, closing the crash window where nonempty FTS data
+            // could otherwise survive without a reconciliation marker.
+            let _module_run_lock = modules::acquire_module_run_lock(&root)?;
+            let (index, rebuilt_index) =
+                Index::open_or_create_with_options_report_and_rebuild_hook(
+                    &index_path,
+                    &embedding_config,
+                    write_options,
+                    || fts::begin_reconciliation(&root),
+                )?;
+            let index = Arc::new(index);
+            fts::recover_if_required(&root, &index, &fts_index)?;
+            (index, rebuilt_index)
+        };
+
+        Self::finish_open(
+            root,
+            config,
+            embedding_config,
+            index,
+            fts_index,
+            rebuilt_index,
+            false,
+        )
+    }
+
+    /// Open a markdown-vdb instance in read-only mode.
+    ///
+    /// Does not acquire the Tantivy writer lock, so it can run concurrently
+    /// with a watcher process. Write operations (ingest, watch) will fail.
+    pub fn open_readonly(root: &Path) -> Result<Self> {
+        let root = root.canonicalize().map_err(|e| {
+            Error::Config(format!(
+                "cannot canonicalize root '{}': {e}",
+                root.display()
+            ))
+        })?;
+
+        let config = Config::load(&root)?;
+        Self::open_readonly_with_config(root, config)
+    }
+
+    /// Open a markdown-vdb instance in read-only mode with an explicit config.
+    pub fn open_readonly_with_config(root: PathBuf, mut config: Config) -> Result<Self> {
+        let root = if root.is_relative() {
+            root.canonicalize().map_err(|e| {
+                Error::Config(format!(
+                    "cannot canonicalize root '{}': {e}",
+                    root.display()
+                ))
+            })?
+        } else {
+            root
+        };
+
+        if config.embedding_dimensions == 0
+            && !resolve_dimensions_from_existing_index(&root, &mut config)?
+        {
+            return Err(Error::Config(
+                "embedding dimensions are unresolved and no index exists".into(),
+            ));
+        }
+
+        let embedding_config = EmbeddingConfig {
+            provider: format!("{:?}", config.embedding_provider),
+            model: config.embedding_model.clone(),
+            dimensions: config.embedding_dimensions,
+        };
+
+        let index_dir = root.join(".markdownvdb");
+        let index_path = index_dir.join("index");
+        let write_options = WriteOptions {
+            quantization: config.vector_quantization.clone(),
+            compress_metadata: config.index_compression,
+        };
+        // Read-only commands must never delete/recreate an incompatible index.
+        // A mutating open/ingest performs the automatic rebuild instead.
+        let index = Arc::new(Index::open_with_options(&index_path, write_options)?);
+
+        let fts_path = index_dir.join("fts");
+        // A pending reconciliation only invalidates the lexical projection.
+        // Read-only commands that never consult FTS (tree, get, links,
+        // semantic search) must keep working while a writable process ingests
+        // or after one was interrupted; FTS-dependent queries check the flag.
+        let fts_pending_reconcile = fts::reconciliation_required(&root)?;
+        let fts_index = Arc::new(FtsIndex::open_readonly(&fts_path)?);
+
+        Self::finish_open(
+            root,
+            config,
+            embedding_config,
+            index,
+            fts_index,
+            false,
+            fts_pending_reconcile,
+        )
+    }
+
+    /// Shared constructor tail: validates config compatibility and builds the instance.
+    fn finish_open(
+        root: PathBuf,
+        config: Config,
+        embedding_config: EmbeddingConfig,
+        index: Arc<Index>,
+        fts_index: Arc<FtsIndex>,
+        index_rebuilt: bool,
+        fts_pending_reconcile: bool,
+    ) -> Result<Self> {
+        let status = index.status();
+        let provider_name = format!("{:?}", config.embedding_provider);
+        let triple_compatible = status.embedding_config.dimensions == config.embedding_dimensions
+            && status.embedding_config.model == config.embedding_model
+            && status.embedding_config.provider == provider_name;
+        let compatible = if triple_compatible {
+            match read_embedding_space(&root) {
+                Ok(Some(stored)) => stored == EmbeddingSpaceDescriptor::from_config(&config),
+                Ok(None) => true,
+                Err(error) => {
+                    warn!(error = %error, "embedding-space descriptor is unreadable");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if !compatible {
+            warn!(
+                stored_provider = %status.embedding_config.provider,
+                stored_model = %status.embedding_config.model,
+                stored_dimensions = status.embedding_config.dimensions,
+                configured_provider = %provider_name,
+                configured_model = %config.embedding_model,
+                configured_dimensions = config.embedding_dimensions,
+                "embedding space changed; vector operations require a full reindex"
+            );
+        }
+
+        let _ = embedding_config; // used by callers for Index::open_or_create_with_options
+
+        info!(
+            root = %root.display(),
+            provider_type = ?config.embedding_provider,
+            dimensions = config.embedding_dimensions,
+            "opened markdown-vdb"
+        );
+
+        Ok(Self {
+            root,
+            config,
+            provider: Mutex::new(None),
+            index,
+            fts_index,
+            fts_pending_reconcile,
+            index_rebuilt: AtomicBool::new(index_rebuilt),
+            embedding_compatible: AtomicBool::new(compatible),
+        })
+    }
+
+    /// Get a reference to the project root directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Get a reference to the loaded configuration.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Get a reference to the index.
+    pub fn index(&self) -> &Index {
+        &self.index
+    }
+
+    /// Get a shared reference to the index (for watcher integration).
+    pub fn index_arc(&self) -> Arc<Index> {
+        Arc::clone(&self.index)
+    }
+
+    /// List compiled-in modules. This is read-only and never runs hooks.
+    pub fn module_descriptors(&self) -> Vec<modules::ModuleDescriptor> {
+        modules::ModuleRunner::builtins().descriptors()
+    }
+
+    /// Run a compiled-in materializing module together with its prerequisite or
+    /// dependent modules, then atomically persist the resulting derived state.
+    pub fn run_module(
+        &self,
+        module: &str,
+        scope: Option<&str>,
+    ) -> Result<modules::ModuleRunReport> {
+        if self.index_rebuilt.load(Ordering::Acquire) {
+            return Err(Error::Config(
+                "the archived index was incompatible and has been recreated; run an unscoped `mdvdb ingest` before running computed modules"
+                    .to_string(),
+            ));
+        }
+        let runner = modules::ModuleRunner::builtins();
+        if !runner
+            .descriptors()
+            .iter()
+            .any(|descriptor| descriptor.id == module)
+        {
+            return Err(Error::Config(format!("unknown module `{module}`")));
+        }
+
+        // Keep membership catch-up, computed writes, index persistence, and any
+        // lexical self-heal in one project-scoped critical section.
+        let lock = modules::acquire_module_run_lock(&self.root)?;
+        let reports =
+            runner.run_dependency_aware_locked(&self.root, &self.index, module, scope, &lock)?;
+        // Manual dependency catch-up can add provisional source metadata or
+        // remove deleted documents without embedding. If it changed membership,
+        // rebuild the lexical projection from the just-saved vector/index
+        // generation before returning so same-process and subsequent read-only
+        // queries cannot observe stale deleted chunks.
+        fts::recover_if_required(&self.root, &self.index, &self.fts_index)?;
+        let requested = reports
+            .iter()
+            .find(|report| report.module == module)
+            .cloned()
+            .ok_or_else(|| Error::Config(format!("unknown module `{module}`")))?;
+        Ok(modules::ModuleRunReport {
+            requested,
+            module_reports: reports,
+        })
+    }
+
+    /// Run a module pipeline while the caller retains the project module lock.
+    /// This is the second half of the desktop overlay transaction protocol.
+    pub fn run_module_locked(
+        &self,
+        module: &str,
+        scope: Option<&str>,
+        lock: &modules::ModuleRunLock,
+    ) -> Result<modules::ModuleRunReport> {
+        if self.index_rebuilt.load(Ordering::Acquire) {
+            return Err(Error::Config(
+                "the archived index was incompatible and has been recreated; run an unscoped `mdvdb ingest` before running computed modules"
+                    .to_string(),
+            ));
+        }
+        let runner = modules::ModuleRunner::builtins();
+        if !runner
+            .descriptors()
+            .iter()
+            .any(|descriptor| descriptor.id == module)
+        {
+            return Err(Error::Config(format!("unknown module `{module}`")));
+        }
+        let reports =
+            runner.run_dependency_aware_locked(&self.root, &self.index, module, scope, lock)?;
+        fts::recover_if_required(&self.root, &self.index, &self.fts_index)?;
+        let requested = reports
+            .iter()
+            .find(|report| report.module == module)
+            .cloned()
+            .ok_or_else(|| Error::Config(format!("unknown module `{module}`")))?;
+        Ok(modules::ModuleRunReport {
+            requested,
+            module_reports: reports,
+        })
+    }
+
+    /// Return cached diagnostics for a module without executing formulas.
+    pub fn module_status(
+        &self,
+        module: &str,
+        scope: Option<&str>,
+    ) -> Result<Vec<modules::ModuleDiagnostic>> {
+        if !modules::ModuleRunner::builtins()
+            .descriptors()
+            .iter()
+            .any(|descriptor| descriptor.id == module)
+        {
+            return Err(Error::Config(format!("unknown module `{module}`")));
+        }
+
+        let prefix = modules::normalize_module_scope(scope);
+        let mut diagnostics = Vec::new();
+        for (path, file) in self.index.get_all_files() {
+            if prefix
+                .as_ref()
+                .is_some_and(|scope| !path_util::path_is_in_scope(&path, scope))
+            {
+                continue;
+            }
+            for entry in file.computed_fields.values() {
+                if entry.module != module {
+                    continue;
+                }
+                if let Some(diagnostic) = &entry.diagnostic {
+                    diagnostics.push(modules::ModuleDiagnostic {
+                        path: Some(path.clone()),
+                        module: diagnostic.module.clone(),
+                        field: diagnostic.field.clone(),
+                        code: diagnostic.code.clone(),
+                        message: diagnostic.message.clone(),
+                        span_start: diagnostic.span_start,
+                        span_end: diagnostic.span_end,
+                    });
+                }
+            }
+        }
+        diagnostics.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.field.cmp(&right.field))
+                .then_with(|| left.code.cmp(&right.code))
+        });
+        Ok(diagnostics)
+    }
+
+    /// Lazily initialize and return the embedding provider.
+    /// Fails if the provider cannot be created (e.g., missing API key).
+    fn ensure_provider(&self) -> Result<Arc<dyn EmbeddingProvider>> {
+        if !self.embedding_compatible.load(Ordering::Acquire) {
+            return Err(Error::Config(
+                "embedding provider, model, or dimensions changed; run `mdvdb ingest --reindex` before using vector operations"
+                    .into(),
+            ));
+        }
+        self.ensure_provider_unchecked()
+    }
+
+    fn ensure_provider_unchecked(&self) -> Result<Arc<dyn EmbeddingProvider>> {
+        let mut guard = self.provider.lock();
+        if let Some(ref p) = *guard {
+            return Ok(Arc::clone(p));
+        }
+        let p: Arc<dyn EmbeddingProvider> = Arc::from(create_provider(&self.config)?);
+        *guard = Some(Arc::clone(&p));
+        Ok(p)
+    }
+
+    /// Get a reference to the embedding provider.
+    /// Lazily creates the provider on first call.
+    pub fn provider(&self) -> Result<Arc<dyn EmbeddingProvider>> {
+        self.ensure_provider()
+    }
+
+    /// Get a shared reference to the embedding provider (for watcher integration).
+    /// Lazily creates the provider on first call.
+    pub fn provider_arc(&self) -> Result<Arc<dyn EmbeddingProvider>> {
+        self.ensure_provider()
+    }
+
+    /// Get a reference to the full-text search index.
+    pub fn fts_index(&self) -> &FtsIndex {
+        &self.fts_index
+    }
+
+    /// Get a shared reference to the FTS index (for watcher integration).
+    pub fn fts_index_arc(&self) -> Arc<FtsIndex> {
+        Arc::clone(&self.fts_index)
+    }
+
+    /// Ingest markdown files into the index.
+    ///
+    /// Pipeline: discover → parse → hash-compare → chunk → embed → upsert → remove deleted → save.
+    pub async fn ingest(&self, options: IngestOptions) -> Result<IngestResult> {
+        let embedding_space_changed = !self.embedding_compatible.load(Ordering::Acquire);
+        if embedding_space_changed && !options.full {
+            return Err(Error::Config(
+                "embedding provider, model, or dimensions changed; incremental ingest is unsafe, run `mdvdb ingest --reindex`"
+                    .into(),
+            ));
+        }
+        if self.index_rebuilt.load(Ordering::Acquire) && options.file.is_some() {
+            return Err(Error::Config(
+                "the archived index was incompatible and has been recreated; the first recovery ingest must be unscoped"
+                    .to_string(),
+                ));
+        }
+        // Serialize the complete raw-index -> computed-field -> save lifecycle,
+        // then refresh the generation that may have been committed while this
+        // process was waiting. This prevents two ingest/watch processes from
+        // later saving divergent branches of the same index generation.
+        let module_run_lock = modules::acquire_module_run_lock(&self.root)?;
+        self.index.reload_from_disk_if_clean()?;
+        fts::recover_if_required(&self.root, &self.index, &self.fts_index)?;
+        let start_time = std::time::Instant::now();
+
+        // Helper: emit progress if callback is set.
+        let emit = |phase: &IngestPhase| {
+            if let Some(ref cb) = options.progress {
+                cb(phase);
+            }
+        };
+
+        // Helper: check if cancellation has been requested.
+        let is_cancelled = || options.cancel.as_ref().is_some_and(|c| c.is_cancelled());
+
+        emit(&IngestPhase::Discovering);
+
+        let discover_start = std::time::Instant::now();
+        let disco = discovery::FileDiscovery::new(&self.root, &self.config);
+
+        // Discover files to process.
+        let discovered = if let Some(ref single_file) = options.file {
+            // Verify the file exists.
+            let full = self.root.join(single_file);
+            if !full.is_file() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("file not found: {}", single_file.display()),
+                )));
+            }
+            vec![single_file.clone()]
+        } else {
+            disco.discover()?
+        };
+        let discover_secs = discover_start.elapsed().as_secs_f64();
+
+        info!(files = discovered.len(), "discovered markdown files");
+
+        // Check cancellation after discovery.
+        if is_cancelled() {
+            emit(&IngestPhase::Cancelled);
+            self.index.save()?;
+            return Ok(IngestResult {
+                files_indexed: 0,
+                files_skipped: 0,
+                files_removed: 0,
+                chunks_created: 0,
+                api_calls: 0,
+                estimated_input_tokens: 0,
+                files_failed: 0,
+                errors: Vec::new(),
+                module_reports: Vec::new(),
+                duration_secs: start_time.elapsed().as_secs_f64(),
+                timings: None,
+                cancelled: true,
+            });
+        }
+
+        // Consistency guard: if FTS has 0 docs but vector index has docs,
+        // force re-indexing of all files into FTS.
+        let fts_doc_count = self.fts_index.num_docs().unwrap_or(0);
+        let vector_doc_count = self.index.status().document_count;
+        let fts_needs_rebuild = !options.full && fts_doc_count == 0 && vector_doc_count > 0;
+        if fts_needs_rebuild {
+            info!(
+                vector_docs = vector_doc_count,
+                "FTS index empty but vector index has documents — will rebuild FTS"
+            );
+        }
+
+        // Get existing hashes from index for skip detection.
+        let existing_hashes = self.index.get_file_hashes();
+        let existing_files = self.index.get_all_files();
+        let existing_paths: std::collections::HashSet<String> =
+            existing_hashes.keys().cloned().collect();
+
+        let mut result = IngestResult {
+            files_indexed: 0,
+            files_skipped: 0,
+            files_removed: 0,
+            chunks_created: 0,
+            api_calls: 0,
+            estimated_input_tokens: 0,
+            files_failed: 0,
+            errors: Vec::new(),
+            module_reports: Vec::new(),
+            duration_secs: 0.0,
+            timings: None,
+            cancelled: false,
+        };
+
+        // Parse all files and collect chunks + hashes.
+        let mut all_batch_chunks: Vec<embedding::batch::Chunk> = Vec::new();
+        let mut current_hashes: HashMap<PathBuf, String> = HashMap::new();
+        let mut parsed_files: HashMap<PathBuf, (parser::MarkdownFile, Vec<chunker::Chunk>)> =
+            HashMap::new();
+        let mut metadata_only_files: HashMap<PathBuf, parser::MarkdownFile> = HashMap::new();
+        let mut discovered_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // Track edge batch chunks (edge ID -> paragraph content).
+        let mut edge_batch_chunks: Vec<embedding::batch::Chunk> = Vec::new();
+        // Track edge metadata for building SemanticEdge entries after embedding.
+        struct EdgeMeta {
+            edge_id: String,
+            source: String,
+            target: String,
+            context_text: String,
+            line_number: usize,
+        }
+        let mut edge_metas: Vec<EdgeMeta> = Vec::new();
+        // First edge id seen per distinct context text; only these are embedded.
+        let mut edge_context_canonical: HashMap<String, String> = HashMap::new();
+        // Edge id -> canonical edge id whose embedding it shares.
+        let mut edge_embedding_aliases: HashMap<String, String> = HashMap::new();
+
+        let parse_start = std::time::Instant::now();
+        let total_files = discovered.len();
+        for (file_idx, path) in discovered.iter().enumerate() {
+            let path_str = path_util::to_slash(path);
+            discovered_paths.insert(path_str.clone());
+
+            emit(&IngestPhase::Parsing {
+                current: file_idx + 1,
+                total: total_files,
+                path: path_str.clone(),
+            });
+
+            // Parse the file.
+            let md = match parser::parse_markdown_file(&self.root, path) {
+                Ok(md) => md,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to parse");
+                    result.files_failed += 1;
+                    emit(&IngestPhase::FileError {
+                        current: file_idx + 1,
+                        total: total_files,
+                        path: path_str.clone(),
+                        message: e.to_string(),
+                        error_count: result.files_failed,
+                    });
+                    result.errors.push(IngestError {
+                        path: path_str,
+                        message: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            // A Formula write-back changes only frontmatter. Track the body
+            // represented by vectors separately so incremental catch-up never
+            // spends embedding tokens on that source-only change.
+            if !options.full {
+                if let Some(existing) = existing_files.get(&path_str) {
+                    let body_hash = parser::compute_content_hash(&md.body);
+                    let source_unchanged = existing.content_hash == md.content_hash;
+                    let embedding_unchanged = existing.embedding_body_hash == body_hash;
+                    if source_unchanged && embedding_unchanged {
+                        debug!(path = %path.display(), "unchanged, skipping");
+                        emit(&IngestPhase::Skipped {
+                            current: file_idx + 1,
+                            total: total_files,
+                            path: path_str.clone(),
+                        });
+                        result.files_skipped += 1;
+                        current_hashes.insert(path.clone(), md.content_hash.clone());
+                        continue;
+                    }
+                    if embedding_unchanged {
+                        debug!(path = %path.display(), "frontmatter-only change, queueing metadata refresh");
+                        current_hashes.insert(path.clone(), md.content_hash.clone());
+                        metadata_only_files.insert(path.clone(), md);
+                        continue;
+                    }
+                }
+            }
+
+            current_hashes.insert(path.clone(), md.content_hash.clone());
+
+            // Chunk the document.
+            let chunks = if md.body.trim().is_empty() {
+                Vec::new()
+            } else {
+                match chunker::chunk_document(
+                    &md,
+                    self.config.chunk_max_tokens,
+                    self.config.chunk_overlap_tokens,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "failed to chunk");
+                        result.files_failed += 1;
+                        emit(&IngestPhase::FileError {
+                            current: file_idx + 1,
+                            total: total_files,
+                            path: path_str.clone(),
+                            message: e.to_string(),
+                            error_count: result.files_failed,
+                        });
+                        result.errors.push(IngestError {
+                            path: path_str,
+                            message: e.to_string(),
+                        });
+                        continue;
+                    }
+                }
+            };
+
+            // Convert to batch chunks for embedding.
+            for chunk in &chunks {
+                all_batch_chunks.push(embedding::batch::Chunk {
+                    id: chunk.id.clone(),
+                    source_path: chunk.source_path.clone(),
+                    content: chunk.content.clone(),
+                });
+            }
+
+            // Extract edge contexts if edge embeddings are enabled.
+            if self.config.edge_embeddings && !md.links.is_empty() {
+                // Raw link line numbers and embedding inputs are body-relative;
+                // frontmatter (including Formula output) must not affect them.
+                let link_contexts = parser::extract_links_with_context(&md.body, &md.links);
+                let source_str = path_util::to_slash(path);
+                for ctx in &link_contexts {
+                    let resolved_target = links::resolve_link(&source_str, &ctx.link.target);
+                    if resolved_target.is_empty() {
+                        continue;
+                    }
+                    let edge_id = format!(
+                        "edge:{}->{}@{}",
+                        source_str, resolved_target, ctx.link.line_number
+                    );
+                    // Links sharing a paragraph (link lists, adjacent lines)
+                    // produce byte-identical embedding inputs; embed each
+                    // distinct text once and alias the rest to it.
+                    match edge_context_canonical.entry(ctx.paragraph.clone()) {
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(edge_id.clone());
+                            edge_batch_chunks.push(embedding::batch::Chunk {
+                                id: edge_id.clone(),
+                                source_path: path.clone(),
+                                content: ctx.paragraph.clone(),
+                            });
+                        }
+                        std::collections::hash_map::Entry::Occupied(canonical) => {
+                            edge_embedding_aliases
+                                .insert(edge_id.clone(), canonical.get().clone());
+                        }
+                    }
+                    edge_metas.push(EdgeMeta {
+                        edge_id,
+                        source: source_str.clone(),
+                        target: resolved_target,
+                        context_text: ctx.paragraph.clone(),
+                        line_number: ctx.link.line_number,
+                    });
+                }
+            }
+
+            parsed_files.insert(path.clone(), (md, chunks));
+        }
+
+        let parse_secs = parse_start.elapsed().as_secs_f64();
+
+        // Check cancellation after parsing.
+        if is_cancelled() {
+            result.cancelled = true;
+            result.duration_secs = start_time.elapsed().as_secs_f64();
+            emit(&IngestPhase::Cancelled);
+            self.index.save()?;
+            return Ok(result);
+        }
+
+        // Include edge chunks in the same batch as regular chunks (no extra API calls).
+        all_batch_chunks.extend(edge_batch_chunks);
+
+        // Embed all changed chunks.
+        // For files we're re-embedding, we pass empty existing hashes so nothing is skipped.
+        let embed_existing: HashMap<PathBuf, String> = HashMap::new();
+        let embed_current: HashMap<PathBuf, String> = all_batch_chunks
+            .iter()
+            .map(|c| (c.source_path.clone(), "changed".to_string()))
+            .collect();
+
+        let embed_start = std::time::Instant::now();
+        let embed_result = if all_batch_chunks.is_empty() {
+            emit(&IngestPhase::Embedding {
+                completed_batches: 0,
+                total_batches: 0,
+                completed_chunks: 0,
+                total_chunks: 0,
+                estimated_input_tokens: 0,
+                total_estimated_input_tokens: 0,
+                api_calls: 0,
+            });
+            embedding::batch::EmbeddingResult::default()
+        } else {
+            let on_batch = |progress: &embedding::batch::EmbeddingBatchProgress| {
+                emit(&IngestPhase::Embedding {
+                    completed_batches: progress.completed_batches,
+                    total_batches: progress.total_batches,
+                    completed_chunks: progress.completed_chunks,
+                    total_chunks: progress.total_chunks,
+                    estimated_input_tokens: progress.estimated_input_tokens,
+                    total_estimated_input_tokens: progress.total_estimated_input_tokens,
+                    api_calls: progress.api_calls,
+                });
+            };
+            embedding::batch::embed_chunks(
+                if embedding_space_changed {
+                    self.ensure_provider_unchecked()?
+                } else {
+                    self.ensure_provider()?
+                }
+                .as_ref(),
+                &all_batch_chunks,
+                &embed_existing,
+                &embed_current,
+                self.config.embedding_batch_size,
+                Some(&on_batch),
+            )
+            .await?
+        };
+        let embed_secs = embed_start.elapsed().as_secs_f64();
+
+        result.api_calls = embed_result.api_calls;
+        result.estimated_input_tokens = embed_result.estimated_input_tokens;
+
+        // Check cancellation after embedding.
+        if is_cancelled() {
+            result.cancelled = true;
+            result.duration_secs = start_time.elapsed().as_secs_f64();
+            emit(&IngestPhase::Cancelled);
+            self.index.save()?;
+            return Ok(result);
+        }
+
+        // Only replace the in-memory vector generation after every embedding
+        // request succeeded and the final pre-mutation cancellation barrier
+        // passed. The previous on-disk generation remains recoverable until
+        // the final atomic save.
+        if embedding_space_changed {
+            let embedding_config = EmbeddingConfig {
+                provider: format!("{:?}", self.config.embedding_provider),
+                model: self.config.embedding_model.clone(),
+                dimensions: self.config.embedding_dimensions,
+            };
+            self.index.reset_embedding_space(&embedding_config)?;
+            self.embedding_compatible.store(true, Ordering::Release);
+        }
+
+        // From this point onward the operation may mutate either companion
+        // store. Leave a durable recovery marker until the vector save and FTS
+        // commit have both succeeded. All ordinary cancellation exits occur
+        // above this boundary and therefore do not create the marker.
+        fts::begin_reconciliation(&self.root)?;
+
+        // A full rebuild replaces FTS in one final commit. Do not stage (or
+        // commit) the clear until every cancellation point has passed, or a
+        // cancelled reindex would destroy the still-valid lexical index.
+        if options.full {
+            debug!("full ingest: staging FTS rebuild");
+            self.fts_index.delete_all()?;
+        }
+
+        // Parsing is still a read-only phase. Apply frontmatter-only refreshes
+        // only after the last pre-upsert cancellation barrier so cancellation
+        // cannot persist a new source hash without running computed-field
+        // modules for that same source revision.
+        let mut metadata_refreshes: Vec<_> = metadata_only_files.values().collect();
+        metadata_refreshes.sort_by(|left, right| left.path.cmp(&right.path));
+        for md in metadata_refreshes {
+            self.index.refresh_source_metadata(md)?;
+            result.files_indexed += 1;
+        }
+
+        // Upsert files with their embeddings.
+        let upsert_start = std::time::Instant::now();
+        for (path, (md, chunks)) in &parsed_files {
+            let embeddings: Vec<Vec<f32>> = chunks
+                .iter()
+                .map(|chunk| {
+                    embed_result
+                        .embeddings
+                        .get(&chunk.id)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            self.index.upsert(md, chunks, &embeddings)?;
+
+            // Upsert into FTS index (strip markdown before indexing for clean BM25).
+            let fts_chunks: Vec<fts::FtsChunkData> = chunks
+                .iter()
+                .map(|c| fts::FtsChunkData {
+                    chunk_id: c.id.clone(),
+                    source_path: path_util::to_slash(&c.source_path),
+                    content: fts::strip_markdown(&c.content),
+                    heading_hierarchy: c.heading_hierarchy.join(" > "),
+                })
+                .collect();
+            let path_str_fts = path_util::to_slash(path);
+            self.fts_index.upsert_chunks(&path_str_fts, &fts_chunks)?;
+
+            result.files_indexed += 1;
+            result.chunks_created += chunks.len();
+            debug!(path = %path.display(), chunks = chunks.len(), "indexed");
+        }
+
+        // Upsert edge vectors and build semantic edge entries.
+        if self.config.edge_embeddings && !edge_metas.is_empty() {
+            // For single-file ingest, remove old edges for the file first.
+            if let Some(ref single_file) = options.file {
+                let source_str = path_util::to_slash(single_file);
+                let source_prefix = format!("edge:{}", source_str);
+                // Get existing edge vectors to find ones belonging to this file.
+                let existing_edges = self.index.get_edge_vectors();
+                let old_edge_ids: Vec<String> = existing_edges
+                    .keys()
+                    .filter(|id| id.starts_with(&source_prefix))
+                    .cloned()
+                    .collect();
+                if !old_edge_ids.is_empty() {
+                    // Remove old edge vectors by upserting empty set after removing via index internals.
+                    // The upsert_edges call will handle replacement since it removes existing edge: prefix entries.
+                    debug!(
+                        count = old_edge_ids.len(),
+                        "removing old edge vectors for single-file re-ingest"
+                    );
+                }
+            }
+
+            // Collect edge vectors from embed results, resolving deduplicated
+            // context texts through their canonical edge's embedding.
+            let edge_embedding_for = |edge_id: &String| {
+                embed_result.embeddings.get(edge_id).or_else(|| {
+                    edge_embedding_aliases
+                        .get(edge_id)
+                        .and_then(|canonical| embed_result.embeddings.get(canonical))
+                })
+            };
+            let edge_vectors: Vec<(String, Vec<f32>)> = edge_metas
+                .iter()
+                .filter_map(|em| {
+                    edge_embedding_for(&em.edge_id).map(|v| (em.edge_id.clone(), v.clone()))
+                })
+                .collect();
+
+            if !edge_vectors.is_empty() {
+                self.index.upsert_edges(&edge_vectors)?;
+                debug!(count = edge_vectors.len(), "upserted edge vectors");
+            }
+
+            // Build SemanticEdge entries and merge into link graph.
+            let mut semantic_edges: HashMap<String, links::SemanticEdge> = HashMap::new();
+            for em in &edge_metas {
+                // Compute strength (cosine similarity to target doc vector) if available.
+                let strength = {
+                    let doc_vectors = self.index.get_document_vectors();
+                    let edge_vec = edge_embedding_for(&em.edge_id);
+                    let target_vec = doc_vectors.get(&em.target);
+                    match (edge_vec, target_vec) {
+                        (Some(ev), Some(tv)) => {
+                            let dot: f32 = ev.iter().zip(tv.iter()).map(|(a, b)| a * b).sum();
+                            let norm_a: f32 = ev.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            let norm_b: f32 = tv.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            if norm_a > 0.0 && norm_b > 0.0 {
+                                Some((dot / (norm_a * norm_b)) as f64)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+
+                semantic_edges.insert(
+                    em.edge_id.clone(),
+                    links::SemanticEdge {
+                        edge_id: em.edge_id.clone(),
+                        source: em.source.clone(),
+                        target: em.target.clone(),
+                        context_text: em.context_text.clone(),
+                        line_number: em.line_number,
+                        strength,
+                        relationship_type: None,
+                        cluster_id: None,
+                    },
+                );
+            }
+
+            // Merge semantic edges into the link graph.
+            let existing_graph = self.index.get_link_graph();
+            {
+                let mut graph = existing_graph.unwrap_or_else(|| links::LinkGraph {
+                    forward: HashMap::new(),
+                    last_updated: 0,
+                    semantic_edges: None,
+                    edge_cluster_state: None,
+                });
+                if let Some(ref single_file) = options.file {
+                    // Single-file ingest: remove old edges for the file, then merge new ones.
+                    let source_str = path_util::to_slash(single_file);
+                    let source_prefix = format!("edge:{}->", source_str);
+                    if let Some(ref mut existing) = graph.semantic_edges {
+                        existing.retain(|id, _| !id.starts_with(&source_prefix));
+                        existing.extend(semantic_edges);
+                    } else {
+                        graph.semantic_edges = Some(semantic_edges);
+                    }
+                } else {
+                    // Full ingest: replace all semantic edges with freshly computed ones.
+                    graph.semantic_edges = Some(semantic_edges);
+                }
+                // Run edge clustering.
+                let clusterer = clustering::Clusterer::new(&self.config);
+
+                // Collect all edge vectors and contexts for clustering.
+                let all_edge_vectors = self.index.get_edge_vectors();
+                let all_edge_contexts: HashMap<String, String> = graph
+                    .semantic_edges
+                    .as_ref()
+                    .map(|edges| {
+                        edges
+                            .iter()
+                            .map(|(id, e)| (id.clone(), e.context_text.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if options.file.is_some() {
+                    // Single-file ingest: assign new edges to nearest cluster, maybe rebalance.
+                    if let Some(ref mut state) = graph.edge_cluster_state {
+                        if !state.clusters.is_empty() {
+                            for em in &edge_metas {
+                                if let Some(vec) = all_edge_vectors.get(&em.edge_id) {
+                                    match clusterer.assign_edge_to_nearest(state, &em.edge_id, vec)
+                                    {
+                                        Ok(cid) => {
+                                            // Update cluster_id on the SemanticEdge.
+                                            if let Some(ref mut edges) = graph.semantic_edges {
+                                                if let Some(edge) = edges.get_mut(&em.edge_id) {
+                                                    edge.cluster_id = Some(cid);
+                                                    // Find relationship_type from the cluster label.
+                                                    if let Some(ci) =
+                                                        state.clusters.iter().find(|c| c.id == cid)
+                                                    {
+                                                        edge.relationship_type =
+                                                            Some(ci.label.clone());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, edge_id = %em.edge_id, "failed to assign edge to cluster")
+                                        }
+                                    }
+                                }
+                            }
+                            // Maybe rebalance.
+                            match clusterer.maybe_rebalance_edges(
+                                state,
+                                &all_edge_vectors,
+                                &all_edge_contexts,
+                                self.config.edge_cluster_rebalance,
+                            ) {
+                                Ok(rebalanced) => {
+                                    if rebalanced {
+                                        // After rebalance, update cluster_id/relationship_type on all edges.
+                                        Self::apply_edge_cluster_labels(&mut graph);
+                                        info!("edge clusters rebalanced after single-file ingest");
+                                    }
+                                }
+                                Err(e) => warn!(error = %e, "edge cluster rebalance failed"),
+                            }
+                        }
+                    }
+                } else {
+                    // Full ingest: run full edge clustering.
+                    match clusterer.cluster_edges(&all_edge_vectors, &all_edge_contexts) {
+                        Ok(state) => {
+                            graph.edge_cluster_state = Some(state);
+                            Self::apply_edge_cluster_labels(&mut graph);
+                            info!("edge clustering complete after full ingest");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "edge clustering failed (non-fatal)");
+                        }
+                    }
+                }
+
+                self.index.update_link_graph(Some(graph));
+            }
+        } // end semantic edges block
+
+        // Consistency guard: rebuild FTS from stored chunks for files that
+        // were skipped (already in vector index but missing from FTS).
+        if fts_needs_rebuild {
+            info!("rebuilding FTS index from stored chunks");
+            let file_hashes = self.index.get_file_hashes();
+            for path_str in file_hashes.keys() {
+                // Skip files we already upserted above.
+                if parsed_files
+                    .keys()
+                    .any(|p| path_util::to_slash(p) == *path_str)
+                {
+                    continue;
+                }
+                if let Some(file_entry) = self.index.get_file(path_str) {
+                    let fts_chunks: Vec<fts::FtsChunkData> = file_entry
+                        .chunk_ids
+                        .iter()
+                        .filter_map(|cid| {
+                            self.index.get_chunk(cid).map(|sc| fts::FtsChunkData {
+                                chunk_id: cid.clone(),
+                                source_path: sc.source_path.clone(),
+                                content: fts::strip_markdown(&sc.content),
+                                heading_hierarchy: sc.heading_hierarchy.join(" > "),
+                            })
+                        })
+                        .collect();
+                    if !fts_chunks.is_empty() {
+                        self.fts_index.upsert_chunks(path_str, &fts_chunks)?;
+                    }
+                }
+            }
+            debug!("FTS rebuild complete");
+        }
+
+        // Remove files that no longer exist on disk (only for full discovery, not single file).
+        emit(&IngestPhase::Cleaning);
+        let mut removed_paths: Vec<String> = Vec::new();
+        if options.file.is_none() {
+            for path_str in &existing_paths {
+                if !discovered_paths.contains(path_str) {
+                    self.index.remove_file(path_str)?;
+                    self.fts_index.remove_file(path_str)?;
+                    result.files_removed += 1;
+                    removed_paths.push(path_str.clone());
+                    debug!(path = %path_str, "removed deleted file from index");
+                }
+            }
+        }
+
+        // Build / update link graph.
+        // The overlay is loaded live here (graph build runs before the schema
+        // recompute below, so the persisted schema can't supply target folders).
+        let graph_overlay = schema::Schema::load_overlay(&self.root).unwrap_or(None);
+        if let Some(ref single_file) = options.file {
+            // Single-file ingest: update links for just this file.
+            // known_files = the indexed file set (same source as body-link validity).
+            let relation_ctx = relations::RelationContext::new(
+                self.index.get_file_hashes().keys().cloned().collect(),
+                graph_overlay,
+            )
+            .with_computed_field_owners(self.computed_field_owners());
+            let mut graph = self
+                .index
+                .get_link_graph()
+                .unwrap_or_else(|| links::LinkGraph {
+                    forward: HashMap::new(),
+                    last_updated: 0,
+                    semantic_edges: None,
+                    edge_cluster_state: None,
+                });
+            if let Some((md, _)) = parsed_files.get(single_file) {
+                links::update_file_links(&mut graph, md, &relation_ctx);
+            } else if let Some(md) = metadata_only_files.get(single_file) {
+                links::update_file_links(&mut graph, md, &relation_ctx);
+            }
+            self.index.update_link_graph(Some(graph));
+        } else {
+            // Full ingest: build link graph from all parsed files.
+            // Also need to include skipped files that are still in the index.
+            // For simplicity, build from parsed files only (changed files).
+            // For a complete graph we'd need all files, but we build from what we parsed.
+            // Re-parse skipped files for link extraction.
+            let mut all_md_files: Vec<parser::MarkdownFile> = Vec::new();
+            for (md, _) in parsed_files.values() {
+                all_md_files.push(md.clone());
+            }
+            // Parse skipped files too (they weren't in parsed_files).
+            for path in &discovered {
+                if !parsed_files.contains_key(path) {
+                    if let Ok(md) = parser::parse_markdown_file(&self.root, path) {
+                        all_md_files.push(md);
+                    }
+                }
+            }
+            // known_files = the discovered on-disk set (matches body-link
+            // Valid/Broken classification downstream).
+            let relation_ctx =
+                relations::RelationContext::new(discovered_paths.clone(), graph_overlay)
+                    .with_computed_field_owners(self.computed_field_owners());
+            let mut graph = links::build_link_graph(&all_md_files, &relation_ctx);
+            // Preserve semantic edges and edge cluster state from the earlier
+            // edge-embedding pass (which stored them before this rebuild).
+            if let Some(prev) = self.index.get_link_graph() {
+                if graph.semantic_edges.is_none() {
+                    graph.semantic_edges = prev.semantic_edges;
+                }
+                if graph.edge_cluster_state.is_none() {
+                    graph.edge_cluster_state = prev.edge_cluster_state;
+                }
+            }
+            self.index.update_link_graph(Some(graph));
+
+            // Remove links for deleted files.
+            if !removed_paths.is_empty() {
+                if let Some(mut graph) = self.index.get_link_graph() {
+                    for path_str in &removed_paths {
+                        links::remove_file_links(&mut graph, path_str);
+                    }
+                    self.index.update_link_graph(Some(graph));
+                }
+            }
+        }
+
+        let upsert_secs = upsert_start.elapsed().as_secs_f64();
+
+        // Keep raw, schema, and derived index mutations in memory until the
+        // final atomic save after all built-in module hooks have run.
+        emit(&IngestPhase::Saving);
+
+        // Run clustering if enabled.
+        if self.config.clustering_enabled {
+            emit(&IngestPhase::Clustering);
+            let clusterer = clustering::Clusterer::new(&self.config);
+            let doc_vectors = self.index.get_document_vectors();
+            let doc_contents = self.index.get_document_contents();
+
+            if !doc_vectors.is_empty() {
+                // Single-file fast path only when a compatible state exists;
+                // otherwise (full ingest, missing state, or algorithm switch)
+                // run a full pass seeded with the previous state for id/label
+                // stability.
+                let existing = self.index.get_clusters();
+                let single_fast_path = options.file.is_some()
+                    && existing
+                        .as_ref()
+                        .is_some_and(|s| !s.clusters.is_empty() && !clusterer.algorithm_changed(s));
+
+                if single_fast_path {
+                    let single_file = options.file.as_ref().expect("checked above");
+                    let mut state = existing.expect("checked above");
+                    let path_str = path_util::to_slash(single_file);
+                    if let Some(vec) = doc_vectors.get(&path_str) {
+                        if let Err(e) =
+                            clusterer.assign_incremental(&mut state, &path_str, vec, &doc_vectors)
+                        {
+                            warn!(error = %e, "failed to assign document to cluster");
+                        } else {
+                            // Attempt rebalance with all document vectors.
+                            match clusterer.maybe_rebalance(&mut state, &doc_vectors, &doc_contents)
+                            {
+                                Ok(rebalanced) => {
+                                    if rebalanced {
+                                        info!("clusters rebalanced after single-file ingest");
+                                    }
+                                }
+                                Err(e) => warn!(error = %e, "cluster rebalance failed"),
+                            }
+                            self.index.update_clusters(Some(state));
+                        }
+                    }
+                } else if options.file.is_none() || existing.is_none() {
+                    // Full clustering pass (also covers single-file ingest with
+                    // no prior state — bootstrap instead of silently skipping).
+                    match clusterer.cluster_all(&doc_vectors, &doc_contents, existing.as_ref()) {
+                        Ok(state) => {
+                            self.index.update_clusters(Some(state));
+                            info!("clustering complete");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "clustering failed (non-fatal)");
+                        }
+                    }
+                } else {
+                    // Single-file ingest with an algorithm switch: re-cluster fully.
+                    match clusterer.cluster_all(&doc_vectors, &doc_contents, existing.as_ref()) {
+                        Ok(state) => {
+                            self.index.update_clusters(Some(state));
+                            info!("clusters rebuilt after algorithm change");
+                        }
+                        Err(e) => warn!(error = %e, "clustering failed (non-fatal)"),
+                    }
+                }
+            }
+        }
+
+        // Topic (custom cluster) assignment — separate layer from auto clusters.
+        if !self.config.custom_cluster_defs.is_empty() {
+            let doc_vectors = self.index.get_document_vectors();
+            if !doc_vectors.is_empty() {
+                let clusterer = clustering::Clusterer::new(&self.config);
+                let expected_fp = clustering::topics_fingerprint(
+                    &self.config.custom_cluster_defs,
+                    self.config.topics_min_similarity,
+                    &self.config.embedding_model,
+                    self.config.embedding_dimensions,
+                );
+                let existing = self.index.get_custom_clusters();
+                let fp_matches = existing
+                    .as_ref()
+                    .is_some_and(|s| s.fingerprint == expected_fp);
+
+                if let (Some(single_file), true) = (options.file.as_ref(), fp_matches) {
+                    // Fast path: definitions unchanged — re-assign just this
+                    // document against the stored centroids (no provider call).
+                    let mut state = existing.expect("fingerprint matched");
+                    let path_str = path_util::to_slash(single_file);
+                    if let Some(vec) = doc_vectors.get(&path_str) {
+                        match clusterer.assign_single_to_custom(&mut state, &path_str, vec) {
+                            Ok(()) => {
+                                self.index.update_custom_clusters(Some(state));
+                            }
+                            Err(e) => warn!(error = %e, "topic assignment failed (non-fatal)"),
+                        }
+                    }
+                } else {
+                    // Full recompute: full ingest, stale fingerprint (edited
+                    // definitions / model change), or missing state. Reuse the
+                    // stored centroids when the fingerprint still matches.
+                    let centroids: crate::Result<Vec<Vec<f32>>> = if fp_matches {
+                        Ok(existing
+                            .as_ref()
+                            .expect("fingerprint matched")
+                            .clusters
+                            .iter()
+                            .map(|c| c.centroid.clone())
+                            .collect())
+                    } else {
+                        match self.ensure_provider() {
+                            Ok(provider) => {
+                                clustering::embed_topic_centroids(
+                                    &self.config.custom_cluster_defs,
+                                    provider.as_ref(),
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    };
+
+                    match centroids.and_then(|centroids| {
+                        clusterer.assign_all_to_custom(
+                            &self.config.custom_cluster_defs,
+                            &centroids,
+                            &doc_vectors,
+                            expected_fp,
+                        )
+                    }) {
+                        Ok(state) => {
+                            self.index.update_custom_clusters(Some(state));
+                            info!("topic assignment complete");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "topic assignment failed (non-fatal)");
+                        }
+                    }
+                }
+            }
+        } else if self.index.get_custom_clusters().is_some() {
+            // Definitions removed from config — clear the state.
+            self.index.update_custom_clusters(None);
+        }
+
+        // Shard-local topic centroids and assignments live in disposable
+        // sidecars. Refresh them only during ingest; read APIs never create an
+        // embedding provider.
+        self.refresh_shard_topics_after_ingest().await;
+
+        // Persist global and scoped schemas.
+        // For single-file ingest, skip schema recomputation.
+        if options.file.is_none() {
+            // Collect all parsed markdown files (processed + skipped).
+            let mut all_md_for_schema: Vec<parser::MarkdownFile> = Vec::new();
+            for (md, _) in parsed_files.values() {
+                all_md_for_schema.push(md.clone());
+            }
+            for path in &discovered {
+                if !parsed_files.contains_key(path) {
+                    if let Ok(md) = parser::parse_markdown_file(&self.root, path) {
+                        all_md_for_schema.push(md);
+                    }
+                }
+            }
+
+            // Infer global schema and merge with overlay.
+            let inferred = schema::Schema::infer(&all_md_for_schema);
+            let overlay = schema::Schema::load_overlay(&self.root).unwrap_or(None);
+            let global_overlay_fields = overlay.as_ref().map(|o| o.fields.clone());
+            let merged = schema::Schema::merge(inferred, global_overlay_fields);
+            self.index.set_schema(Some(merged));
+
+            // Compute scoped schemas: auto-discovered scopes + overlay-defined scopes.
+            let mut scope_names: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for s in schema::Schema::discover_scopes(&all_md_for_schema) {
+                scope_names.insert(s);
+            }
+            if let Some(ref ov) = overlay {
+                for scope in ov.scopes.keys() {
+                    scope_names.insert(scope.clone());
+                }
+            }
+            match shards::ShardStore::new(&self.root).list() {
+                Ok(list) => {
+                    for shard in list.shards {
+                        scope_names.insert(shard.path);
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "ignoring malformed Shard definitions while caching scoped schemas"
+                    );
+                }
+            }
+
+            if !scope_names.is_empty() {
+                let mut scoped_schemas = Vec::new();
+                for scope in &scope_names {
+                    let scoped_inferred = schema::Schema::infer_scoped(&all_md_for_schema, scope);
+                    let scoped_overlay_fields = overlay
+                        .as_ref()
+                        .and_then(|o| o.scopes.get(scope))
+                        .map(|so| so.fields.clone());
+                    let scoped_merged =
+                        schema::Schema::merge(scoped_inferred, scoped_overlay_fields);
+                    scoped_schemas.push(schema::ScopedSchema {
+                        scope: scope.clone(),
+                        schema: scoped_merged,
+                    });
+                }
+                self.index.set_scoped_schemas(Some(scoped_schemas));
+            } else {
+                self.index.set_scoped_schemas(None);
+            }
+        }
+
+        // Derived-data hooks always run after raw/schema mutations and before
+        // the operation's final atomic index save. A normal full-vault ingest
+        // is also the watcher-off catch-up path for schema definition changes.
+        let module_event = if let Some(single_file) = &options.file {
+            modules::ModuleEvent::FilesChanged {
+                upserted: vec![path_util::to_slash(single_file)],
+                removed: removed_paths.clone(),
+                renamed: Vec::new(),
+            }
+        } else if options.full {
+            modules::ModuleEvent::FullIngest
+        } else {
+            modules::ModuleEvent::FilesChanged {
+                upserted: parsed_files
+                    .keys()
+                    .chain(metadata_only_files.keys())
+                    .map(|path| path_util::to_slash(path))
+                    .collect(),
+                removed: removed_paths.clone(),
+                renamed: Vec::new(),
+            }
+        };
+        result.module_reports = modules::ModuleRunner::builtins().run_locked(
+            &self.root,
+            &self.index,
+            &module_event,
+            &module_run_lock,
+        )?;
+        let save_start = std::time::Instant::now();
+        // The module runner writes the index once, atomically, while its
+        // cross-process guard still covers raw/schema/module state.
+        self.fts_index.commit()?;
+        fts::finish_reconciliation(&self.root)?;
+        write_embedding_space(&self.root, &self.config)?;
+
+        let save_secs = save_start.elapsed().as_secs_f64();
+
+        result.duration_secs = start_time.elapsed().as_secs_f64();
+        if options.file.is_none() {
+            self.index_rebuilt.store(false, Ordering::Release);
+        }
+        result.timings = Some(IngestTimings {
+            discover_secs,
+            parse_secs,
+            embed_secs,
+            upsert_secs,
+            save_secs,
+            total_secs: result.duration_secs,
+        });
+
+        emit(&IngestPhase::Done);
+
+        info!(
+            files_indexed = result.files_indexed,
+            files_skipped = result.files_skipped,
+            files_removed = result.files_removed,
+            chunks_created = result.chunks_created,
+            api_calls = result.api_calls,
+            duration_secs = result.duration_secs,
+            "ingestion complete"
+        );
+
+        Ok(result)
+    }
+
+    /// Apply cluster labels to all semantic edges based on the current edge_cluster_state.
+    fn apply_edge_cluster_labels(graph: &mut links::LinkGraph) {
+        if let (Some(ref state), Some(ref mut edges)) =
+            (&graph.edge_cluster_state, &mut graph.semantic_edges)
+        {
+            // Build edge_id → (cluster_id, label) lookup from cluster members.
+            let mut edge_to_cluster: HashMap<String, (usize, String)> = HashMap::new();
+            for cluster in &state.clusters {
+                for member in &cluster.members {
+                    edge_to_cluster.insert(member.clone(), (cluster.id, cluster.label.clone()));
+                }
+            }
+            for (edge_id, edge) in edges.iter_mut() {
+                if let Some((cid, label)) = edge_to_cluster.get(edge_id) {
+                    edge.cluster_id = Some(*cid);
+                    edge.relationship_type = Some(label.clone());
+                }
+            }
+        }
+    }
+
+    /// Execute a search query against the index.
+    pub async fn search(&self, query: search::SearchQuery) -> Result<search::SearchResponse> {
+        // Lexical and hybrid retrieval read the FTS projection, which a
+        // pending reconciliation marks as possibly stale. Semantic queries
+        // never consult it and stay available on a read-only instance.
+        if self.fts_pending_reconcile && query.mode != SearchMode::Semantic {
+            return Err(Error::Fts(
+                "FTS reconciliation is pending; open the project in writable mode to repair it"
+                    .to_string(),
+            ));
+        }
+        // Pure lexical retrieval does not use vectors. Avoid constructing a
+        // cloud provider (and allow lexical access to an index whose embedding
+        // descriptor changed) unless graph expansion explicitly needs a query
+        // embedding.
+        let pure_lexical = query.mode == SearchMode::Lexical
+            && query
+                .expand_graph
+                .unwrap_or(self.config.search_expand_graph)
+                == 0;
+        let provider: Arc<dyn EmbeddingProvider> = if pure_lexical {
+            Arc::new(embedding::mock::MockProvider::new(
+                self.config.embedding_dimensions,
+            ))
+        } else {
+            self.ensure_provider()?
+        };
+        let mut response = search::search(
+            &query,
+            &self.index,
+            provider.as_ref(),
+            Some(&self.fts_index),
+            self.config.search_rrf_k,
+            self.config.bm25_norm_k,
+            self.config.search_decay_enabled,
+            self.config.search_decay_half_life,
+            &self.config.search_decay_exclude,
+            &self.config.search_decay_include,
+            self.config.search_boost_links,
+            self.config.search_boost_hops,
+            self.config.search_expand_graph,
+            self.config.search_expand_limit,
+            self.config.edge_boost_weight,
+        )
+        .await?;
+
+        // Populate is post-processing in this wrapper (the engine ignores the
+        // flag) so overlay/index context never threads through its signature.
+        // Only ranked results are populated — graph_context stays untouched.
+        if query.populate {
+            let ctx = self.relation_context();
+            let empty = serde_json::json!({});
+            for result in &mut response.results {
+                let frontmatter = result.file.frontmatter.as_ref().unwrap_or(&empty);
+                result.file.relations =
+                    Some(self.compute_relations(&result.file.path, frontmatter, &ctx));
+            }
+        }
+
+        Ok(response)
+    }
+
+    /// Preview what an ingestion would do, without making any API calls or modifying the index.
+    ///
+    /// This is intentionally synchronous because it performs no network requests.
+    /// It discovers, parses, and chunks files, then compares hashes with the existing index.
+    pub fn preview(&self, reindex: bool, file: Option<PathBuf>) -> Result<IngestPreview> {
+        build_ingest_preview(
+            &self.root,
+            &self.config,
+            &self.index.get_file_hashes(),
+            reindex,
+            file,
+        )
+    }
+
+    /// Preview ingestion for a collection that does not have an index yet.
+    ///
+    /// No embedding provider is created and no index or FTS files are written.
+    pub fn preview_without_index(
+        root: &Path,
+        config: &Config,
+        reindex: bool,
+        file: Option<PathBuf>,
+    ) -> Result<IngestPreview> {
+        build_ingest_preview(root, config, &HashMap::new(), reindex, file)
+    }
+
+    /// Return a stats snapshot for the whole vault or a folder scope.
+    ///
+    /// `path` scopes the stats to a folder prefix (recursive, like
+    /// `search --path`); `None` or `"."` covers the whole vault. Like
+    /// [`preview`](Self::preview), this is synchronous and makes no network
+    /// requests: reindex estimates are computed by re-parsing, re-chunking,
+    /// and re-tokenizing in-scope files from disk. A scope matching nothing
+    /// returns zeroed counts rather than an error.
+    pub fn info(&self, path: Option<&str>) -> Result<VaultInfo> {
+        let (scope, _schema_key, is_whole_vault) = normalize_collection_scope(path.unwrap_or("."));
+
+        let disco = discovery::FileDiscovery::new(&self.root, &self.config);
+        let discovered = disco.discover()?;
+        let existing_hashes = self.index.get_file_hashes();
+
+        let in_scope = |path: &str| is_whole_vault || path_util::path_is_in_scope(path, &scope);
+
+        let mut sync = SyncBreakdown::default();
+        let mut file_count: usize = 0;
+        let mut reindex_chunks: usize = 0;
+        let mut reindex_estimated_tokens: usize = 0;
+        let mut seen_on_disk: HashSet<String> = HashSet::new();
+
+        for path in &discovered {
+            let path_str = path_util::to_slash(path);
+            if !in_scope(&path_str) {
+                continue;
+            }
+
+            let md = match parser::parse_markdown_file(&self.root, path) {
+                Ok(md) => md,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to parse during info");
+                    continue;
+                }
+            };
+
+            match existing_hashes.get(&path_str) {
+                Some(existing) if *existing == md.content_hash => sync.unchanged += 1,
+                Some(_) => sync.changed += 1,
+                None => sync.new += 1,
+            }
+            seen_on_disk.insert(path_str);
+            file_count += 1;
+
+            let chunks = match chunker::chunk_document(
+                &md,
+                self.config.chunk_max_tokens,
+                self.config.chunk_overlap_tokens,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to chunk during info");
+                    continue;
+                }
+            };
+
+            // Full-reindex estimate: every in-scope file counts, unchanged or not.
+            reindex_chunks += chunks.len();
+            reindex_estimated_tokens += chunks
+                .iter()
+                .map(|c| chunker::count_tokens(&c.content))
+                .sum::<usize>();
+        }
+
+        sync.deleted = existing_hashes
+            .keys()
+            .filter(|p| in_scope(p) && !seen_on_disk.contains(*p))
+            .count();
+
+        let counts = self
+            .index
+            .scoped_counts(if is_whole_vault { None } else { Some(&scope) });
+        let status = self.index.status();
+        let vector_count = if is_whole_vault {
+            status.vector_count
+        } else {
+            counts.chunks + counts.edges
+        };
+
+        let batch_size = self.config.embedding_batch_size.max(1);
+        let reindex_estimated_api_calls = if reindex_chunks == 0 {
+            0
+        } else {
+            reindex_chunks.div_ceil(batch_size)
+        };
+
+        Ok(VaultInfo {
+            scope,
+            is_whole_vault,
+            file_count,
+            indexed_file_count: counts.files,
+            chunk_count: counts.chunks,
+            vector_count,
+            edge_count: counts.edges,
+            reindex_chunks,
+            reindex_estimated_tokens,
+            reindex_estimated_api_calls,
+            index_file_size: status.file_size,
+            embedding: status.embedding_config,
+            sync,
+            last_updated: status.last_updated,
+        })
+    }
+
+    /// Return a status snapshot of the index.
+    pub fn status(&self) -> index::types::IndexStatus {
+        let mut status = self.index.status();
+        let compatible = self.embedding_compatible.load(Ordering::Acquire);
+        status.embedding_compatible = compatible;
+        status.reindex_required = !compatible;
+        status.embedding_compatibility_error = (!compatible).then(|| {
+            "embedding provider, model, dimensions, codec, purpose settings, normalization, or endpoint identity changed; run `mdvdb ingest --reindex`"
+                .to_string()
+        });
+        status
+    }
+
+    /// Return the metadata schema, either from the index or inferred from discovered files.
+    pub fn schema(&self) -> Result<schema::Schema> {
+        let base = if let Some(stored) = self.index.get_schema() {
+            stored
+        } else {
+            let disco = discovery::FileDiscovery::new(&self.root, &self.config);
+            let files = disco.discover()?;
+            let mut parsed = Vec::new();
+            for path in &files {
+                match parser::parse_markdown_file(&self.root, path) {
+                    Ok(md) => parsed.push(md),
+                    Err(_) => continue,
+                }
+            }
+            schema::Schema::infer(&parsed)
+        }
+        .reclassify_legacy_file_fields();
+
+        // Ordinary overlay annotations remain live, but computed definitions
+        // come only from the persisted module snapshot. This prevents a
+        // read-only query from exposing new definitions alongside stale values.
+        // A malformed overlay likewise falls back to the cached schema and its
+        // persisted formula diagnostics.
+        let global_fields = schema::Schema::load_overlay(&self.root)
+            .ok()
+            .flatten()
+            .map(|value| without_computed_overlay_fields(value.fields));
+        Ok(schema::Schema::merge(base, global_fields))
+    }
+
+    /// Return the inferred schema for files matching a path prefix.
+    ///
+    /// If a scoped schema for `path_prefix` is persisted in the index, returns it
+    /// directly. Otherwise, discovers and parses files to infer on the fly.
+    pub fn schema_scoped(&self, path_prefix: &str) -> Result<schema::ScopedSchema> {
+        let path_prefix = &path_util::normalize_path_input(path_prefix);
+        let base = if let Some(scoped) = self.index.get_scoped_schema(path_prefix) {
+            scoped.schema
+        } else {
+            let disco = discovery::FileDiscovery::new(&self.root, &self.config);
+            let files = disco.discover()?;
+            let mut parsed = Vec::new();
+            for path in &files {
+                match parser::parse_markdown_file(&self.root, path) {
+                    Ok(md) => parsed.push(md),
+                    Err(_) => continue,
+                }
+            }
+            schema::Schema::infer_scoped(&parsed, path_prefix)
+        }
+        .reclassify_legacy_file_fields();
+
+        let overlay_fields = schema::Schema::load_overlay(&self.root)
+            .ok()
+            .flatten()
+            .map(|value| {
+                without_computed_overlay_fields(schema::Schema::resolve_overlay_for_path(
+                    &value,
+                    Some(path_prefix),
+                ))
+            });
+        let merged = schema::Schema::merge(base, overlay_fields);
+        Ok(schema::ScopedSchema {
+            scope: path_prefix.to_string(),
+            schema: merged,
+        })
+    }
+
+    /// Initialize a new markdown-vdb project by creating `.markdownvdb/config.yaml`
+    /// with default/example values.
+    ///
+    /// Returns `Error::ConfigAlreadyExists` if the config already exists.
+    pub fn init(root: &Path) -> Result<()> {
+        let dir_path = root.join(".markdownvdb");
+        let yaml_config_path = dir_path.join("config.yaml");
+        let dotenv_config_path = dir_path.join(".config");
+
+        // Check for YAML, dotenv, and legacy config locations.
+        if yaml_config_path.exists() {
+            return Err(Error::ConfigAlreadyExists {
+                path: yaml_config_path,
+            });
+        }
+        if dotenv_config_path.exists() {
+            return Err(Error::ConfigAlreadyExists {
+                path: dotenv_config_path,
+            });
+        }
+        let legacy_path = root.join(".markdownvdb");
+        if legacy_path.is_file() {
+            return Err(Error::ConfigAlreadyExists { path: legacy_path });
+        }
+
+        // Create the .markdownvdb directory if it doesn't exist.
+        if !dir_path.exists() {
+            std::fs::create_dir_all(&dir_path)?;
+        }
+
+        let default_config = "\
+# markdown-vdb configuration
+# See https://github.com/example/markdown-vdb for documentation
+
+# Embedding provider configuration
+embedding:
+  provider: openai
+  model: text-embedding-3-small
+  dimensions: auto
+  batch_size: 100
+
+# Search defaults
+search:
+  limit: 10
+  min_score: 0.0
+  mode: hybrid
+  rrf_k: 60.0
+  # decay:
+  #   enabled: false
+  #   half_life: 30
+  #   anchor: modified
+
+# Chunking
+chunking:
+  max_tokens: 512
+  overlap_tokens: 50
+
+# Clustering
+clustering:
+  enabled: true
+  rebalance_threshold: 50
+  # custom:
+  #   - name: my-cluster
+  #     seeds: [\"seed1.md\", \"seed2.md\"]
+
+# File watching
+watch:
+  enabled: true
+  debounce_ms: 300
+
+# Source directories
+sources:
+  dirs:
+    - .
+";
+
+        std::fs::write(&yaml_config_path, default_config)?;
+        info!(path = %yaml_config_path.display(), "created default config file");
+        Ok(())
+    }
+
+    /// Start watching for file changes and re-index incrementally.
+    ///
+    /// Blocks until the provided `cancel` token is triggered (e.g. Ctrl+C).
+    /// An optional `event_callback` is invoked after each event is processed.
+    pub async fn watch(
+        &self,
+        cancel: CancellationToken,
+        event_callback: Option<watcher::WatchEventCallback>,
+    ) -> Result<()> {
+        if self.index_rebuilt.load(Ordering::Acquire) {
+            return Err(Error::Config(
+                "the archived index was incompatible and has been recreated; run an unscoped `mdvdb ingest` before starting the watcher"
+                    .to_string(),
+            ));
+        }
+        let w = watcher::Watcher::new(
+            self.config.clone(),
+            &self.root,
+            Arc::clone(&self.index),
+            Arc::clone(&self.fts_index),
+            self.ensure_provider()?,
+            event_callback,
+        );
+        w.watch(cancel).await
+    }
+
+    /// Return cluster summaries for the indexed documents.
+    pub fn clusters(&self) -> Result<Vec<ClusterSummary>> {
+        match self.index.get_clusters() {
+            Some(state) => Ok(state
+                .clusters
+                .iter()
+                .map(|c| ClusterSummary {
+                    id: c.id,
+                    document_count: c.members.len(),
+                    label: if c.label.is_empty() {
+                        None
+                    } else {
+                        Some(c.label.clone())
+                    },
+                    keywords: c.keywords.clone(),
+                    parent_id: c.parent_id,
+                    representative: c.representative.clone(),
+                })
+                .collect()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Return summaries of user-defined topics (custom clusters).
+    pub fn custom_clusters(&self) -> Result<Vec<CustomClusterSummary>> {
+        match self.index.get_custom_clusters() {
+            Some(state) => Ok(state
+                .clusters
+                .iter()
+                .map(|c| CustomClusterSummary {
+                    id: c.id,
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                    seed_phrases: c.seed_phrases.clone(),
+                    threshold: c.threshold,
+                    document_count: c.members.len(),
+                    mean_score: if c.members.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            c.members.iter().map(|m| m.score).sum::<f32>() / c.members.len() as f32,
+                        )
+                    },
+                })
+                .collect()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Return the documents matching no topic (the Unassigned bucket).
+    /// Empty when no topics are defined or computed.
+    pub fn topic_unassigned(&self) -> Result<Vec<String>> {
+        Ok(self
+            .index
+            .get_custom_clusters()
+            .map(|state| state.unassigned)
+            .unwrap_or_default())
+    }
+
+    /// Return automatic clusters computed from only the documents in a Shard.
+    ///
+    /// Analysis is derived lazily from existing collection vectors and cached
+    /// outside the index. No embedding provider is created by this read.
+    pub fn clusters_for_shard(&self, shard_id: &str) -> Result<Vec<ClusterSummary>> {
+        let analysis = self.shard_analysis(shard_id)?;
+        Ok(cluster_summaries(analysis.clusters.as_ref()))
+    }
+
+    /// Return local topic summaries for one Shard.
+    ///
+    /// Stale topic definitions/model settings require ingest and therefore
+    /// yield no computed assignments on this provider-free read.
+    pub fn custom_clusters_for_shard(&self, shard_id: &str) -> Result<Vec<CustomClusterSummary>> {
+        shards::ShardStore::new(&self.root).topics(shard_id)?;
+        let analysis = self.shard_analysis(shard_id)?;
+        Ok(custom_cluster_summaries(analysis.topics.as_ref()))
+    }
+
+    /// Return the Shard-local topic Unassigned bucket.
+    pub fn topic_unassigned_for_shard(&self, shard_id: &str) -> Result<Vec<String>> {
+        shards::ShardStore::new(&self.root).topics(shard_id)?;
+        let analysis = self.shard_analysis(shard_id)?;
+        Ok(analysis
+            .topics
+            .map(|state| state.unassigned)
+            .unwrap_or_default())
+    }
+
+    fn shard_analysis(&self, shard_id: &str) -> Result<ShardDerivedAnalysis> {
+        use shard_analysis::{
+            cluster_fingerprint, cluster_settings_fingerprint, clusterable_document_count,
+            corpus_fingerprint, effective_shard_knn, full_fingerprint, scoped_maps,
+            topic_fingerprint, ShardAnalysisCache, ShardAnalysisCacheStore,
+            SHARD_ANALYSIS_CACHE_FORMAT, SHARD_ANALYSIS_CACHE_VERSION,
+        };
+
+        let shard_store = shards::ShardStore::new(&self.root);
+        let shard = shard_store.get(shard_id)?;
+        let topic_definitions = shard_store.topics(shard_id);
+        let topic_error = topic_definitions.as_ref().err().map(ToString::to_string);
+        let topics_are_malformed = topic_error.is_some();
+        let topic_definitions = topic_definitions.unwrap_or_default();
+
+        if !shard.exists {
+            return Ok(ShardDerivedAnalysis {
+                info: GraphAnalysisInfo {
+                    context: GraphAnalysisContext::Shard,
+                    shard_id: Some(shard.id.clone()),
+                    shard_path: Some(shard.path.clone()),
+                    clusters: ClusterAnalysisStatus::Disabled,
+                    topics: if topic_error.is_some() {
+                        TopicAnalysisStatus::Error
+                    } else if topic_definitions.is_empty() {
+                        TopicAnalysisStatus::None
+                    } else {
+                        TopicAnalysisStatus::NeedsIngest
+                    },
+                    message: Some(format!(
+                        "Shard folder '{}' is missing; restore or retarget it",
+                        shard.path
+                    )),
+                },
+                shard,
+                clusters: None,
+                topics: None,
+            });
+        }
+
+        let file_hashes = self.index.get_file_hashes();
+        let all_vectors = self.index.get_document_vectors();
+        let all_documents = self.index.get_document_contents();
+        let (vectors, documents) = scoped_maps(&shard.path, &all_vectors, &all_documents);
+        let corpus_fp = corpus_fingerprint(&shard.path, &file_hashes);
+        let effective_knn =
+            if self.config.clustering_algorithm == config::ClusteringAlgorithm::Leiden {
+                effective_shard_knn(
+                    self.config.clustering_knn,
+                    clusterable_document_count(&vectors),
+                )
+            } else {
+                self.config.clustering_knn
+            };
+        let cluster_settings_fp = cluster_settings_fingerprint(&self.config, effective_knn);
+        let cluster_fp = cluster_fingerprint(&corpus_fp, &cluster_settings_fp);
+        let topic_fp = topic_fingerprint(&self.config, &topic_definitions);
+        let full_fp = full_fingerprint(&shard.id, &shard.path, &corpus_fp, &cluster_fp, &topic_fp);
+        let cache_store = ShardAnalysisCacheStore::new(&self.root, shard_id);
+        let shard_for_update = shard.clone();
+        let mut config = self.config.clone();
+        config.clustering_knn = effective_knn;
+
+        cache_store.update(move |current| {
+            // A retargeted Shard deliberately invalidates all derived state.
+            let current = current.filter(|cache| cache.shard_path == shard_for_update.path);
+            let mut messages = Vec::new();
+
+            let (clusters, cluster_status) = if !config.clustering_enabled {
+                (None, ClusterAnalysisStatus::Disabled)
+            } else if vectors.len() < 2 {
+                (None, ClusterAnalysisStatus::TooSmall)
+            } else if let Some(state) = current
+                .as_ref()
+                .filter(|cache| cache.cluster_fingerprint == cluster_fp)
+                .and_then(|cache| cache.clusters.clone())
+            {
+                (Some(state), ClusterAnalysisStatus::Ready)
+            } else {
+                let previous = current.as_ref().and_then(|cache| {
+                    (cache.cluster_settings_fingerprint == cluster_settings_fp)
+                        .then_some(cache.clusters.as_ref())
+                        .flatten()
+                });
+                match clustering::Clusterer::new(&config)
+                    .cluster_all(&vectors, &documents, previous)
+                {
+                    Ok(state) => (Some(state), ClusterAnalysisStatus::Ready),
+                    Err(error) => {
+                        messages.push(format!("Shard clustering failed: {error}"));
+                        (None, ClusterAnalysisStatus::Error)
+                    }
+                }
+            };
+
+            let (topics, topic_status, stored_topic_fp) = if let Some(error) = topic_error {
+                messages.push(error);
+                (
+                    None,
+                    TopicAnalysisStatus::Error,
+                    current
+                        .as_ref()
+                        .map(|cache| cache.topic_fingerprint.clone())
+                        .unwrap_or_else(|| topic_fp.clone()),
+                )
+            } else if topic_definitions.is_empty() {
+                (None, TopicAnalysisStatus::None, topic_fp.clone())
+            } else {
+                let cached_centroids = current.as_ref().and_then(|cache| {
+                    topic_centroids_if_compatible(
+                        cache.topics.as_ref()?,
+                        &topic_definitions,
+                        &topic_fp,
+                        config.embedding_dimensions,
+                    )
+                });
+                if current
+                    .as_ref()
+                    .is_some_and(|cache| cache.topic_corpus_fingerprint == corpus_fp)
+                {
+                    if let Some(state) = current.as_ref().and_then(|cache| {
+                        cached_centroids
+                            .is_some()
+                            .then(|| cache.topics.clone())
+                            .flatten()
+                    }) {
+                        (Some(state), TopicAnalysisStatus::Ready, topic_fp.clone())
+                    } else {
+                        (None, TopicAnalysisStatus::NeedsIngest, topic_fp.clone())
+                    }
+                } else if let Some(centroids) = cached_centroids {
+                    match clustering::Clusterer::new(&config).assign_all_to_custom(
+                        &topic_definitions,
+                        &centroids,
+                        &vectors,
+                        topic_fp.clone(),
+                    ) {
+                        Ok(state) => (Some(state), TopicAnalysisStatus::Ready, topic_fp.clone()),
+                        Err(error) => {
+                            messages.push(format!("Shard topic assignment failed: {error}"));
+                            (None, TopicAnalysisStatus::Error, topic_fp.clone())
+                        }
+                    }
+                } else {
+                    (None, TopicAnalysisStatus::NeedsIngest, topic_fp.clone())
+                }
+            };
+            if topic_status == TopicAnalysisStatus::NeedsIngest {
+                messages.push(
+                    "Shard Topics need ingest before local centroids and assignments are available"
+                        .to_string(),
+                );
+            }
+            // Keep previously valid centroids recoverable while malformed YAML
+            // is being repaired, but never expose its stale assignments.
+            let topics_for_cache = if topics_are_malformed {
+                current.as_ref().and_then(|cache| cache.topics.clone())
+            } else {
+                topics.clone()
+            };
+            let topic_corpus_fp = if topics_are_malformed && topics_for_cache.is_some() {
+                current
+                    .as_ref()
+                    .map(|cache| cache.topic_corpus_fingerprint.clone())
+                    .unwrap_or_else(|| corpus_fp.clone())
+            } else {
+                corpus_fp.clone()
+            };
+
+            let cache = ShardAnalysisCache {
+                format: SHARD_ANALYSIS_CACHE_FORMAT.to_string(),
+                version: SHARD_ANALYSIS_CACHE_VERSION,
+                shard_id: shard_for_update.id.clone(),
+                shard_path: shard_for_update.path.clone(),
+                fingerprint: full_fp,
+                corpus_fingerprint: corpus_fp,
+                cluster_fingerprint: cluster_fp,
+                cluster_settings_fingerprint: cluster_settings_fp,
+                topic_fingerprint: stored_topic_fp,
+                topic_corpus_fingerprint: topic_corpus_fp,
+                clusters: clusters.clone(),
+                topics: topics_for_cache,
+            };
+            let output = ShardDerivedAnalysis {
+                shard: shard_for_update.clone(),
+                clusters,
+                topics,
+                info: GraphAnalysisInfo {
+                    context: GraphAnalysisContext::Shard,
+                    shard_id: Some(shard_for_update.id.clone()),
+                    shard_path: Some(shard_for_update.path.clone()),
+                    clusters: cluster_status,
+                    topics: topic_status,
+                    message: (!messages.is_empty()).then(|| messages.join("; ")),
+                },
+            };
+            Ok((cache, output))
+        })
+    }
+
+    async fn refresh_shard_topics_after_ingest(&self) {
+        use shard_analysis::{
+            cluster_fingerprint, cluster_settings_fingerprint, clusterable_document_count,
+            corpus_fingerprint, effective_shard_knn, full_fingerprint, scoped_maps,
+            topic_fingerprint, ShardAnalysisCache, ShardAnalysisCacheStore,
+            SHARD_ANALYSIS_CACHE_FORMAT, SHARD_ANALYSIS_CACHE_VERSION,
+        };
+
+        let store = shards::ShardStore::new(&self.root);
+        let list = match store.list() {
+            Ok(list) => list,
+            Err(error) => {
+                warn!(%error, "skipping Shard topic refresh because Shard YAML is malformed");
+                return;
+            }
+        };
+        if list.shards.is_empty() {
+            return;
+        }
+
+        let file_hashes = self.index.get_file_hashes();
+        let all_vectors = self.index.get_document_vectors();
+        let all_documents = self.index.get_document_contents();
+        // Reuse identical local-topic centroids across Shards during this
+        // ingest, but never seed this pool from collection-level Topics.
+        let mut centroid_pool: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
+
+        for shard in list.shards {
+            if !shard.exists {
+                continue;
+            }
+            let definitions = match store.topics(&shard.id) {
+                Ok(definitions) => definitions,
+                Err(error) => {
+                    warn!(
+                        shard = %shard.id,
+                        %error,
+                        "skipping malformed Shard-local topics"
+                    );
+                    continue;
+                }
+            };
+
+            let cache_store = ShardAnalysisCacheStore::new(&self.root, &shard.id);
+            let current = match cache_store.load() {
+                Ok(cache) => cache.filter(|cache| cache.shard_path == shard.path),
+                Err(error) => {
+                    warn!(shard = %shard.id, %error, "ignoring unreadable Shard analysis cache");
+                    None
+                }
+            };
+            let corpus_fp = corpus_fingerprint(&shard.path, &file_hashes);
+            let topic_fp = topic_fingerprint(&self.config, &definitions);
+            let (vectors, _documents) = scoped_maps(&shard.path, &all_vectors, &all_documents);
+            let effective_knn =
+                if self.config.clustering_algorithm == config::ClusteringAlgorithm::Leiden {
+                    effective_shard_knn(
+                        self.config.clustering_knn,
+                        clusterable_document_count(&vectors),
+                    )
+                } else {
+                    self.config.clustering_knn
+                };
+            let settings_fp = cluster_settings_fingerprint(&self.config, effective_knn);
+            let cluster_fp = cluster_fingerprint(&corpus_fp, &settings_fp);
+
+            let topics = if definitions.is_empty() {
+                None
+            } else {
+                if !centroid_pool.contains_key(&topic_fp) {
+                    if let Some(centroids) = current.as_ref().and_then(|cache| {
+                        topic_centroids_if_compatible(
+                            cache.topics.as_ref()?,
+                            &definitions,
+                            &topic_fp,
+                            self.config.embedding_dimensions,
+                        )
+                    }) {
+                        centroid_pool.insert(topic_fp.clone(), centroids);
+                    }
+                }
+
+                let centroids = if let Some(centroids) = centroid_pool.get(&topic_fp) {
+                    Ok(centroids.clone())
+                } else {
+                    match self.ensure_provider() {
+                        Ok(provider) => {
+                            clustering::embed_topic_centroids(&definitions, provider.as_ref()).await
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                match centroids.and_then(|centroids| {
+                    centroid_pool.insert(topic_fp.clone(), centroids.clone());
+                    clustering::Clusterer::new(&self.config).assign_all_to_custom(
+                        &definitions,
+                        &centroids,
+                        &vectors,
+                        topic_fp.clone(),
+                    )
+                }) {
+                    Ok(state) => Some(state),
+                    Err(error) => {
+                        warn!(
+                            shard = %shard.id,
+                            %error,
+                            "Shard-local topic refresh failed (non-fatal)"
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            let write_result = cache_store.update(|latest| {
+                let latest = latest.filter(|cache| cache.shard_path == shard.path);
+                // Topic refresh advances the topic corpus, but must not erase a
+                // compatible previous auto-cluster state. Keep the
+                // fingerprints that actually produced those clusters so the
+                // next lazy graph read detects corpus staleness and supplies
+                // the state to `cluster_all` for stable IDs/colors.
+                let (clusters, stored_cluster_fp, stored_settings_fp) = latest
+                    .as_ref()
+                    .and_then(|cache| {
+                        cache.clusters.clone().map(|clusters| {
+                            (
+                                Some(clusters),
+                                cache.cluster_fingerprint.clone(),
+                                cache.cluster_settings_fingerprint.clone(),
+                            )
+                        })
+                    })
+                    .unwrap_or_else(|| (None, cluster_fp.clone(), settings_fp.clone()));
+                let stored_full_fp = full_fingerprint(
+                    &shard.id,
+                    &shard.path,
+                    &corpus_fp,
+                    &stored_cluster_fp,
+                    &topic_fp,
+                );
+                let cache = ShardAnalysisCache {
+                    format: SHARD_ANALYSIS_CACHE_FORMAT.to_string(),
+                    version: SHARD_ANALYSIS_CACHE_VERSION,
+                    shard_id: shard.id.clone(),
+                    shard_path: shard.path.clone(),
+                    fingerprint: stored_full_fp,
+                    corpus_fingerprint: corpus_fp.clone(),
+                    cluster_fingerprint: stored_cluster_fp,
+                    cluster_settings_fingerprint: stored_settings_fp,
+                    topic_fingerprint: topic_fp,
+                    topic_corpus_fingerprint: corpus_fp,
+                    clusters,
+                    topics,
+                };
+                Ok((cache, ()))
+            });
+            if let Err(error) = write_result {
+                warn!(
+                    shard = %shard.id,
+                    %error,
+                    "failed to save Shard-local topic analysis (non-fatal)"
+                );
+            }
+        }
+    }
+
+    fn document_graph_scaffold(&self, path_filter: Option<&str>) -> DocumentGraphScaffold {
+        let clusters = self.index.get_clusters();
+        let topics = self.index.get_custom_clusters();
+        self.document_graph_scaffold_with_analysis(path_filter, clusters.as_ref(), topics.as_ref())
+    }
+
+    fn document_graph_scaffold_with_analysis(
+        &self,
+        path_filter: Option<&str>,
+        cluster_state: Option<&clustering::ClusterState>,
+        custom_cluster_state: Option<&clustering::CustomClusterState>,
+    ) -> DocumentGraphScaffold {
+        let file_hashes = self.index.get_file_hashes();
+        let indexed_paths: HashSet<String> = file_hashes
+            .keys()
+            .filter(|p| match path_filter {
+                Some(scope) => path_util::path_is_in_scope(p, scope),
+                None => true,
+            })
+            .cloned()
+            .collect();
+
+        let mut path_to_cluster: HashMap<String, usize> = HashMap::new();
+        let mut clusters = Vec::new();
+        if let Some(state) = cluster_state {
+            for cluster in &state.clusters {
+                for member in &cluster.members {
+                    path_to_cluster.insert(member.clone(), cluster.id);
+                }
+                if let Some(cluster) = graph_cluster_from_auto_visible(cluster, &indexed_paths) {
+                    clusters.push(cluster);
+                }
+            }
+        }
+
+        let path_to_topics = topic_membership_map(custom_cluster_state);
+        let custom_clusters = custom_cluster_state
+            .map(|state| {
+                state
+                    .clusters
+                    .iter()
+                    .filter_map(|cluster| graph_cluster_from_topic_visible(cluster, &indexed_paths))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut nodes: Vec<GraphNode> = indexed_paths
+            .iter()
+            .map(|path| {
+                let topics = path_to_topics.get(path);
+                GraphNode {
+                    id: path.clone(),
+                    path: path.clone(),
+                    label: None,
+                    chunk_index: None,
+                    cluster_id: path_to_cluster.get(path).copied(),
+                    custom_cluster_id: topics.and_then(|t| t.first().map(|(id, _)| *id)),
+                    custom_cluster_ids: topics
+                        .map(|t| t.iter().map(|(id, _)| *id).collect())
+                        .unwrap_or_default(),
+                    custom_cluster_scores: topics
+                        .map(|t| t.iter().map(|(_, s)| *s).collect())
+                        .unwrap_or_default(),
+                    size: None,
+                }
+            })
+            .collect();
+        nodes.sort_unstable_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+
+        DocumentGraphScaffold {
+            indexed_paths,
+            nodes,
+            clusters,
+            custom_clusters,
+        }
+    }
+
+    /// Return graph data combining indexed files, link edges, and cluster membership.
+    pub fn graph_data(&self, path_filter: Option<&str>) -> Result<GraphData> {
+        let scaffold = self.document_graph_scaffold(path_filter);
+        self.graph_data_from_scaffold(scaffold, None)
+    }
+
+    fn graph_data_from_scaffold(
+        &self,
+        scaffold: DocumentGraphScaffold,
+        analysis: Option<GraphAnalysisInfo>,
+    ) -> Result<GraphData> {
+        let DocumentGraphScaffold {
+            indexed_paths,
+            nodes,
+            clusters,
+            custom_clusters,
+        } = scaffold;
+
+        // Project the stored graph while borrowing it under one read lock. The
+        // previous implementation cloned the complete semantic graph twice,
+        // including every context string, before building this response.
+        let (edges, edge_clusters) = self.index.with_link_graph(|link_graph| {
+            let mut edges = Vec::new();
+            let mut visible_edge_ids = HashSet::new();
+            if let Some(link_graph) = link_graph {
+                for (source, entries) in &link_graph.forward {
+                    if !indexed_paths.contains(source) {
+                        continue;
+                    }
+                    for entry in entries {
+                        if indexed_paths.contains(&entry.target) {
+                            // Look up semantic edge metadata if available (relation
+                            // edges use field-qualified ids and never carry semantic data).
+                            let edge_id = links::entry_edge_id(entry);
+                            let semantic = link_graph
+                                .semantic_edges
+                                .as_ref()
+                                .and_then(|se| se.get(&edge_id));
+                            visible_edge_ids.insert(edge_id);
+                            edges.push(GraphEdge {
+                                source: source.clone(),
+                                target: entry.target.clone(),
+                                weight: None,
+                                relationship_type: semantic
+                                    .and_then(|s| s.relationship_type.clone()),
+                                strength: semantic.and_then(|s| s.strength),
+                                context_text: semantic.map(|s| s.context_text.clone()),
+                                edge_cluster_id: semantic.and_then(|s| s.cluster_id),
+                                field: entry.field.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            let edge_clusters = graph_edge_clusters(link_graph, &visible_edge_ids);
+
+            (edges, edge_clusters)
+        });
+
+        Ok(GraphData {
+            nodes,
+            edges,
+            clusters,
+            level: "document".to_string(),
+            edge_clusters,
+            custom_clusters,
+            analysis,
+        })
+    }
+
+    /// Return the versioned compact graph wire response used by visualization
+    /// clients. Full edge contexts are deduplicated into a response-level
+    /// string table and are never cloned once per rendered edge.
+    pub fn graph_data_compact(&self, path_filter: Option<&str>) -> Result<CompactGraphData> {
+        let scaffold = self.document_graph_scaffold(path_filter);
+        self.graph_data_compact_from_scaffold(scaffold, None)
+    }
+
+    fn graph_data_compact_from_scaffold(
+        &self,
+        scaffold: DocumentGraphScaffold,
+        analysis: Option<GraphAnalysisInfo>,
+    ) -> Result<CompactGraphData> {
+        let DocumentGraphScaffold {
+            indexed_paths,
+            nodes,
+            clusters,
+            custom_clusters,
+        } = scaffold;
+
+        let (edges, contexts, edge_clusters) = self.index.with_link_graph(|link_graph| {
+            let mut edges = Vec::new();
+            let mut contexts = Vec::new();
+            let mut visible_edge_ids = HashSet::new();
+
+            if let Some(link_graph) = link_graph {
+                // The keys borrow the already-stored semantic contexts, while
+                // the response table owns one copy of each distinct string.
+                let mut context_indices: HashMap<&str, usize> = HashMap::new();
+
+                for (source, entries) in &link_graph.forward {
+                    if !indexed_paths.contains(source) {
+                        continue;
+                    }
+                    for entry in entries {
+                        if !indexed_paths.contains(&entry.target) {
+                            continue;
+                        }
+
+                        let edge_id = links::entry_edge_id(entry);
+                        let semantic = link_graph
+                            .semantic_edges
+                            .as_ref()
+                            .and_then(|semantic_edges| semantic_edges.get(&edge_id));
+                        visible_edge_ids.insert(edge_id);
+                        let context_index = semantic.map(|semantic_edge| {
+                            let context = semantic_edge.context_text.as_str();
+                            if let Some(index) = context_indices.get(context) {
+                                *index
+                            } else {
+                                let index = contexts.len();
+                                contexts.push(context.to_string());
+                                context_indices.insert(context, index);
+                                index
+                            }
+                        });
+
+                        edges.push(CompactGraphEdge {
+                            source: source.clone(),
+                            target: entry.target.clone(),
+                            weight: None,
+                            relationship_type: semantic
+                                .and_then(|edge| edge.relationship_type.clone()),
+                            strength: semantic.and_then(|edge| edge.strength),
+                            context_index,
+                            edge_cluster_id: semantic.and_then(|edge| edge.cluster_id),
+                            field: entry.field.clone(),
+                        });
+                    }
+                }
+            }
+
+            let edge_clusters = graph_edge_clusters(link_graph, &visible_edge_ids);
+            (edges, contexts, edge_clusters)
+        });
+
+        Ok(CompactGraphData {
+            format: COMPACT_GRAPH_FORMAT.to_string(),
+            version: COMPACT_GRAPH_VERSION,
+            nodes,
+            edges,
+            contexts,
+            clusters,
+            level: "document".to_string(),
+            edge_clusters,
+            custom_clusters,
+            analysis,
+        })
+    }
+
+    /// Return a document graph whose cluster/topic identities are computed
+    /// from the full Shard while `visible_path` only projects visible nodes.
+    pub fn graph_data_for_shard(
+        &self,
+        shard_id: &str,
+        visible_path: Option<&str>,
+    ) -> Result<GraphData> {
+        let analysis = self.shard_analysis(shard_id)?;
+        let scope = analysis
+            .shard
+            .exists
+            .then(|| shard_visible_scope(&analysis.shard.path, visible_path))
+            .flatten();
+        let scaffold = scope
+            .as_deref()
+            .map(|scope| {
+                self.document_graph_scaffold_with_analysis(
+                    Some(scope),
+                    analysis.clusters.as_ref(),
+                    analysis.topics.as_ref(),
+                )
+            })
+            .unwrap_or_else(DocumentGraphScaffold::empty);
+        self.graph_data_from_scaffold(scaffold, Some(analysis.info))
+    }
+
+    /// Compact equivalent of [`graph_data_for_shard`](Self::graph_data_for_shard).
+    pub fn graph_data_compact_for_shard(
+        &self,
+        shard_id: &str,
+        visible_path: Option<&str>,
+    ) -> Result<CompactGraphData> {
+        let analysis = self.shard_analysis(shard_id)?;
+        let scope = analysis
+            .shard
+            .exists
+            .then(|| shard_visible_scope(&analysis.shard.path, visible_path))
+            .flatten();
+        let scaffold = scope
+            .as_deref()
+            .map(|scope| {
+                self.document_graph_scaffold_with_analysis(
+                    Some(scope),
+                    analysis.clusters.as_ref(),
+                    analysis.topics.as_ref(),
+                )
+            })
+            .unwrap_or_else(DocumentGraphScaffold::empty);
+        self.graph_data_compact_from_scaffold(scaffold, Some(analysis.info))
+    }
+
+    /// Return chunk-level graph data with embedding-similarity edges.
+    ///
+    /// Each chunk becomes a node, and edges represent the top-k most similar
+    /// chunks across different files (intra-file edges are excluded).
+    pub fn graph_data_chunks(&self, k: usize, path_filter: Option<&str>) -> Result<GraphData> {
+        let clusters = self.index.get_clusters();
+        let topics = self.index.get_custom_clusters();
+        self.graph_data_chunks_with_analysis(
+            k,
+            path_filter,
+            clusters.as_ref(),
+            topics.as_ref(),
+            None,
+        )
+    }
+
+    fn graph_data_chunks_with_analysis(
+        &self,
+        k: usize,
+        path_filter: Option<&str>,
+        cluster_state: Option<&clustering::ClusterState>,
+        custom_cluster_state: Option<&clustering::CustomClusterState>,
+        analysis: Option<GraphAnalysisInfo>,
+    ) -> Result<GraphData> {
+        use std::collections::HashSet;
+
+        let mut chunk_vectors: Vec<_> = self
+            .index
+            .get_chunk_vectors()
+            .into_iter()
+            .filter(|cv| match path_filter {
+                Some(scope) => path_util::path_is_in_scope(&cv.source_path, scope),
+                None => true,
+            })
+            .collect();
+        // Stable order keeps both the parallel result batches and serialized
+        // graph output deterministic across HashMap insertion orders.
+        chunk_vectors.sort_unstable_by(|a, b| a.chunk_id.cmp(&b.chunk_id));
+        if chunk_vectors.is_empty() {
+            return Ok(GraphData {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                clusters: Vec::new(),
+                level: "chunk".to_string(),
+                edge_clusters: Vec::new(),
+                custom_clusters: Vec::new(),
+                analysis,
+            });
+        }
+
+        let visible_paths: HashSet<String> = chunk_vectors
+            .iter()
+            .map(|chunk| chunk.source_path.clone())
+            .collect();
+
+        // Build path → cluster_id map from ClusterState
+        let mut path_to_cluster: HashMap<String, usize> = HashMap::new();
+        let mut clusters = Vec::new();
+        if let Some(state) = cluster_state {
+            for cluster in &state.clusters {
+                for member in &cluster.members {
+                    path_to_cluster.insert(member.clone(), cluster.id);
+                }
+                if let Some(cluster) = graph_cluster_from_auto_visible(cluster, &visible_paths) {
+                    clusters.push(cluster);
+                }
+            }
+        }
+
+        // Build path → topic memberships map (multi-label, score-sorted)
+        let path_to_topics = topic_membership_map(custom_cluster_state);
+        let custom_clusters = custom_cluster_state
+            .map(|state| {
+                state
+                    .clusters
+                    .iter()
+                    .filter_map(|cluster| graph_cluster_from_topic_visible(cluster, &visible_paths))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // Build nodes — inherit cluster/topic membership from parent document
+        let nodes: Vec<GraphNode> = chunk_vectors
+            .iter()
+            .map(|cv| {
+                let label = if cv.heading_hierarchy.is_empty() {
+                    None
+                } else {
+                    Some(cv.heading_hierarchy.join(" > "))
+                };
+                let topics = path_to_topics.get(&cv.source_path);
+                GraphNode {
+                    id: cv.chunk_id.clone(),
+                    path: cv.source_path.clone(),
+                    label,
+                    chunk_index: Some(cv.chunk_index),
+                    cluster_id: path_to_cluster.get(&cv.source_path).copied(),
+                    custom_cluster_id: topics.and_then(|t| t.first().map(|(id, _)| *id)),
+                    custom_cluster_ids: topics
+                        .map(|t| t.iter().map(|(id, _)| *id).collect())
+                        .unwrap_or_default(),
+                    custom_cluster_scores: topics
+                        .map(|t| t.iter().map(|(_, s)| *s).collect())
+                        .unwrap_or_default(),
+                    size: Some(cv.content_len as f64),
+                }
+            })
+            .collect();
+
+        // Borrowed id lookup keeps scoped-neighbor checks and edge deduplication
+        // numeric, avoiding path-sized String clones in the hot graph loop.
+        let chunk_indices: HashMap<&str, usize> = chunk_vectors
+            .iter()
+            .enumerate()
+            .map(|(index, cv)| (cv.chunk_id.as_str(), index))
+            .collect();
+
+        // Build edges: for each chunk, search kNN and keep top-k cross-file
+        let search_k = k + 20;
+        let mut seen_edges: HashSet<(usize, usize)> = HashSet::new();
+        let mut edges = Vec::new();
+        let queries: Vec<&[f32]> = chunk_vectors
+            .iter()
+            .map(|chunk| chunk.vector.as_slice())
+            .collect();
+        let neighbor_batch = self.index.search_vectors_batch(&queries, search_k)?;
+
+        for (source_index, (cv, results)) in
+            chunk_vectors.iter().zip(neighbor_batch.matches).enumerate()
+        {
+            let mut cross_file_count = 0;
+            for (neighbor_id_index, score) in results {
+                let neighbor_id = &neighbor_batch.ids[neighbor_id_index];
+                if cross_file_count >= k {
+                    break;
+                }
+                // Skip self
+                if neighbor_id == &cv.chunk_id {
+                    continue;
+                }
+                // The batch search covers the full index. A scoped graph may
+                // therefore see neighbors outside its node set; omit them so
+                // every serialized edge remains a closed-topology reference.
+                let Some(&target_index) = chunk_indices.get(neighbor_id.as_str()) else {
+                    continue;
+                };
+                // Skip intra-file
+                if chunk_vectors[target_index].source_path == cv.source_path {
+                    continue;
+                }
+                // Deduplicate bidirectional edges
+                let edge_key = if source_index < target_index {
+                    (source_index, target_index)
+                } else {
+                    (target_index, source_index)
+                };
+                if seen_edges.contains(&edge_key) {
+                    cross_file_count += 1;
+                    continue;
+                }
+                seen_edges.insert(edge_key);
+                edges.push(GraphEdge {
+                    source: cv.chunk_id.clone(),
+                    target: neighbor_id.clone(),
+                    weight: Some(score),
+                    relationship_type: None,
+                    strength: None,
+                    context_text: None,
+                    edge_cluster_id: None,
+                    field: None,
+                });
+                cross_file_count += 1;
+            }
+        }
+
+        Ok(GraphData {
+            nodes,
+            edges,
+            clusters,
+            level: "chunk".to_string(),
+            edge_clusters: Vec::new(),
+            custom_clusters,
+            analysis,
+        })
+    }
+
+    /// Return a chunk graph with Shard-local document cluster/topic identity.
+    pub fn graph_data_chunks_for_shard(
+        &self,
+        k: usize,
+        shard_id: &str,
+        visible_path: Option<&str>,
+    ) -> Result<GraphData> {
+        let analysis = self.shard_analysis(shard_id)?;
+        let scope = analysis
+            .shard
+            .exists
+            .then(|| shard_visible_scope(&analysis.shard.path, visible_path))
+            .flatten();
+        let Some(scope) = scope else {
+            return Ok(GraphData {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                clusters: Vec::new(),
+                level: "chunk".to_string(),
+                edge_clusters: Vec::new(),
+                custom_clusters: Vec::new(),
+                analysis: Some(analysis.info),
+            });
+        };
+        self.graph_data_chunks_with_analysis(
+            k,
+            Some(&scope),
+            analysis.clusters.as_ref(),
+            analysis.topics.as_ref(),
+            Some(analysis.info),
+        )
+    }
+
+    /// Return graph data at the specified level.
+    ///
+    /// Routes `Document` to [`graph_data()`](Self::graph_data) and `Chunk` to
+    /// [`graph_data_chunks()`](Self::graph_data_chunks) with k=5.
+    pub fn graph(&self, level: GraphLevel, path_filter: Option<&str>) -> Result<GraphData> {
+        match level {
+            GraphLevel::Document => self.graph_data(path_filter),
+            GraphLevel::Chunk => self.graph_data_chunks(5, path_filter),
+        }
+    }
+
+    /// Return graph data using the versioned compact visualization contract.
+    ///
+    /// Document graphs are projected directly from the borrowed link graph so
+    /// repeated semantic contexts are never materialized per edge. Chunk graph
+    /// edges have no contexts and are converted without changing their data.
+    pub fn graph_compact(
+        &self,
+        level: GraphLevel,
+        path_filter: Option<&str>,
+    ) -> Result<CompactGraphData> {
+        match level {
+            GraphLevel::Document => self.graph_data_compact(path_filter),
+            GraphLevel::Chunk => Ok(self.graph_data_chunks(5, path_filter)?.into()),
+        }
+    }
+
+    /// Query links originating from a specific file.
+    pub fn links(&self, path: &str) -> Result<links::LinkQueryResult> {
+        let graph = self.index.get_link_graph().ok_or_else(|| {
+            Error::Config("no link graph available; run ingest first".to_string())
+        })?;
+        let path = path_util::normalize_path_input(path);
+        let path = path.strip_prefix("./").unwrap_or(&path);
+        let indexed_files: std::collections::HashSet<String> =
+            self.index.get_file_hashes().keys().cloned().collect();
+        if !indexed_files.contains(path) {
+            return Err(Error::FileNotInIndex {
+                path: std::path::PathBuf::from(path),
+            });
+        }
+        let backlink_map = links::compute_backlinks(&graph);
+        Ok(links::query_links(
+            path,
+            &graph,
+            &backlink_map,
+            &indexed_files,
+        ))
+    }
+
+    /// Query the multi-hop link neighborhood of a file.
+    ///
+    /// Returns a tree-structured view of outgoing and incoming links
+    /// up to `depth` hops (clamped to 1–3).
+    pub fn links_neighborhood(
+        &self,
+        path: &str,
+        depth: usize,
+    ) -> Result<links::NeighborhoodResult> {
+        let graph = self.index.get_link_graph().ok_or_else(|| {
+            Error::Config("no link graph available; run ingest first".to_string())
+        })?;
+        let path = path_util::normalize_path_input(path);
+        let path = path.strip_prefix("./").unwrap_or(&path);
+        let indexed_files: std::collections::HashSet<String> =
+            self.index.get_file_hashes().keys().cloned().collect();
+        if !indexed_files.contains(path) {
+            return Err(Error::FileNotInIndex {
+                path: std::path::PathBuf::from(path),
+            });
+        }
+        Ok(links::neighborhood(&graph, &indexed_files, path, depth))
+    }
+
+    /// Query backlinks pointing to a specific file.
+    pub fn backlinks(&self, path: &str) -> Result<Vec<links::ResolvedLink>> {
+        let graph = self.index.get_link_graph().ok_or_else(|| {
+            Error::Config("no link graph available; run ingest first".to_string())
+        })?;
+        let path = path_util::normalize_path_input(path);
+        let indexed_files: std::collections::HashSet<String> =
+            self.index.get_file_hashes().keys().cloned().collect();
+        let backlink_map = links::compute_backlinks(&graph);
+        let entries = backlink_map.get(&path).cloned().unwrap_or_default();
+        Ok(entries
+            .into_iter()
+            .map(|entry| {
+                let state = if indexed_files.contains(&entry.source) {
+                    links::LinkState::Valid
+                } else {
+                    links::LinkState::Broken
+                };
+                links::ResolvedLink { entry, state }
+            })
+            .collect())
+    }
+
+    /// Find orphan files (no incoming or outgoing links).
+    pub fn orphans(&self) -> Result<Vec<links::OrphanFile>> {
+        let graph = self.index.get_link_graph().ok_or_else(|| {
+            Error::Config("no link graph available; run ingest first".to_string())
+        })?;
+        let indexed_files: std::collections::HashSet<String> =
+            self.index.get_file_hashes().keys().cloned().collect();
+        Ok(links::find_orphans(&graph, &indexed_files))
+    }
+
+    /// Get semantic edges, optionally filtered by file path.
+    ///
+    /// Returns all edges if `file` is `None`, or only edges where the given
+    /// file is either the source or target.
+    pub fn edges(&self, file: Option<&str>) -> Result<Vec<SemanticEdge>> {
+        let graph = self.index.get_link_graph().ok_or_else(|| {
+            Error::Config("no link graph available; run ingest first".to_string())
+        })?;
+        let all_edges = match &graph.semantic_edges {
+            Some(map) => map.values().cloned().collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        match file {
+            Some(path) => {
+                let path = path_util::normalize_path_input(path);
+                let path = path.strip_prefix("./").unwrap_or(&path);
+                Ok(all_edges
+                    .into_iter()
+                    .filter(|e| e.source == path || e.target == path)
+                    .collect())
+            }
+            None => Ok(all_edges),
+        }
+    }
+
+    /// Get the edge clustering state, if available.
+    pub fn edge_clusters(&self) -> Result<Option<EdgeClusterState>> {
+        let graph = self.index.get_link_graph().ok_or_else(|| {
+            Error::Config("no link graph available; run ingest first".to_string())
+        })?;
+        Ok(graph.edge_cluster_state.clone())
+    }
+
+    /// Build a file tree showing sync state of all discovered files.
+    ///
+    /// Compares files on disk against the index to classify each as
+    /// indexed, modified, new, or deleted.
+    pub fn file_tree(&self) -> Result<tree::FileTree> {
+        tree::build_file_tree(&self.root, &self.config, &self.index)
+    }
+
+    /// Get information about an indexed document by its relative path.
+    pub fn get_document(&self, relative_path: &str) -> Result<DocumentInfo> {
+        let relative_path = &path_util::normalize_path_input(relative_path);
+        let file = self
+            .index
+            .get_file(relative_path)
+            .ok_or_else(|| Error::FileNotInIndex {
+                path: PathBuf::from(relative_path),
+            })?;
+
+        let frontmatter = file.effective_frontmatter();
+
+        let modified_at = self.index.get_file_mtime(relative_path);
+
+        Ok(DocumentInfo {
+            path: relative_path.to_string(),
+            content_hash: file.content_hash.clone(),
+            frontmatter,
+            computed_fields: file.computed_values_json(),
+            computed_field_errors: file.computed_errors_json(),
+            chunk_count: file.chunk_ids.len(),
+            file_size: file.file_size,
+            indexed_at: file.indexed_at,
+            modified_at,
+            relations: None,
+            referenced_by: None,
+        })
+    }
+
+    /// [`get_document`](Self::get_document) plus resolved `relations` and
+    /// `referenced_by` (phase-31 populate). Output is otherwise byte-identical
+    /// to `get_document`; both populate keys are always set (`{}` / `[]` when
+    /// empty), never `None`.
+    pub fn get_document_populated(&self, relative_path: &str) -> Result<DocumentInfo> {
+        let relative_path = &path_util::normalize_path_input(relative_path);
+        let mut doc = self.get_document(relative_path)?;
+        let ctx = self.relation_context();
+        let empty = serde_json::json!({});
+        let frontmatter = doc.frontmatter.as_ref().unwrap_or(&empty);
+        doc.relations = Some(self.compute_relations(relative_path, frontmatter, &ctx));
+        doc.referenced_by = Some(self.compute_referenced_by(relative_path)?);
+        Ok(doc)
+    }
+
+    /// Build a [`relations::RelationContext`] for populate calls: the indexed
+    /// file set plus the live overlay. Build ONE per populate call.
+    fn relation_context(&self) -> relations::RelationContext {
+        let overlay = schema::Schema::load_overlay(&self.root).unwrap_or(None);
+        relations::RelationContext::new(
+            self.index.get_file_hashes().keys().cloned().collect(),
+            overlay,
+        )
+        .with_computed_field_owners(self.computed_field_owners())
+    }
+
+    /// Persisted computed ownership used to keep stale materialized values out
+    /// of relation graph/populate semantics while definitions are changing.
+    fn computed_field_owners(&self) -> HashMap<String, std::collections::HashSet<String>> {
+        self.index
+            .get_all_files()
+            .into_iter()
+            .filter_map(|(path, file)| {
+                let fields: std::collections::HashSet<String> = file
+                    .computed_fields
+                    .iter()
+                    .filter(|(field, entry)| file.materialized_field_matches(field, entry))
+                    .map(|(field, _)| field)
+                    .cloned()
+                    .collect();
+                (!fields.is_empty()).then_some((path, fields))
+            })
+            .collect()
+    }
+
+    /// Resolve every link-shaped frontmatter value of `source` to a
+    /// [`relations::RelationValue`] (value-driven; the schema only labels).
+    /// Self-references are skipped; a field left with no values produces no key.
+    /// `BTreeMap` keeps the map keys alphabetical per the contract.
+    fn compute_relations(
+        &self,
+        source: &str,
+        frontmatter: &serde_json::Value,
+        ctx: &relations::RelationContext,
+    ) -> std::collections::BTreeMap<String, Vec<relations::RelationValue>> {
+        let mut map: std::collections::BTreeMap<String, Vec<relations::RelationValue>> =
+            std::collections::BTreeMap::new();
+
+        for fm_link in parser::extract_frontmatter_links(Some(frontmatter)) {
+            if ctx.is_file_field(source, &fm_link.field)
+                || ctx.is_formula_field(source, &fm_link.field)
+            {
+                continue;
+            }
+            let target_folder = ctx.target_for(source, &fm_link.field);
+            let resolved = relations::resolve_relation_target(
+                source,
+                &fm_link.target,
+                target_folder.as_deref(),
+                &ctx.known_files,
+            );
+
+            let value = match resolved {
+                Some((path, _)) if path == source => continue, // self-FK is meaningless
+                Some((path, exists)) => {
+                    let (title, target_frontmatter) = if exists {
+                        let stored_fm: Option<serde_json::Value> = self
+                            .index
+                            .get_file(&path)
+                            .and_then(|file| file.effective_frontmatter());
+                        let title_fm = stored_fm.clone().unwrap_or_else(|| serde_json::json!({}));
+                        (Some(derive_title(&path, &title_fm).0), stored_fm)
+                    } else {
+                        (None, None)
+                    };
+                    relations::RelationValue {
+                        raw: fm_link.raw,
+                        path: Some(path),
+                        exists,
+                        title,
+                        frontmatter: target_frontmatter,
+                    }
+                }
+                None => relations::RelationValue {
+                    raw: fm_link.raw,
+                    path: None,
+                    exists: false,
+                    title: None,
+                    frontmatter: None,
+                },
+            };
+
+            map.entry(fm_link.field).or_default().push(value);
+        }
+
+        map
+    }
+
+    /// Reverse relation lookups for `path`: link-graph backlinks carrying a
+    /// `field`, sorted by `(source, field)`. An absent graph degrades to an
+    /// empty list — populate must not fail on fresh vaults.
+    fn compute_referenced_by(&self, path: &str) -> Result<Vec<relations::ReferencedBy>> {
+        let Some(graph) = self.index.get_link_graph() else {
+            return Ok(Vec::new());
+        };
+        let backlinks = links::compute_backlinks(&graph);
+        let mut result: Vec<relations::ReferencedBy> = backlinks
+            .get(path)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let field = entry.field.clone()?;
+                        let source_fm = self
+                            .index
+                            .get_file(&entry.source)
+                            .and_then(|file| file.effective_frontmatter())
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        Some(relations::ReferencedBy {
+                            title: derive_title(&entry.source, &source_fm).0,
+                            source: entry.source.clone(),
+                            field,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        result.sort_by(|a, b| a.source.cmp(&b.source).then_with(|| a.field.cmp(&b.field)));
+        Ok(result)
+    }
+
+    /// Return all documents under a folder as table rows, with column definitions,
+    /// applying server-side filter/sort/pagination. Strictly read-only.
+    ///
+    /// This is the backend for a NocoDB/Airtable-style table view: rows are
+    /// documents (full frontmatter each), columns are frontmatter fields (the
+    /// scoped schema ∪ any keys present in the returned rows that the schema
+    /// missed). It performs no embedding, HNSW, or BM25 work and never writes
+    /// Markdown files — it is synchronous like [`preview`](Self::preview) and
+    /// [`file_tree`](Self::file_tree).
+    ///
+    /// Order of operations (so `total_rows` is well-defined):
+    /// gather + scope/depth filter → metadata filter → `total_rows` → sort
+    /// (type-aware, nulls-last) → `offset`/`limit` → columns (from the full
+    /// filtered set, so the column layout is stable across pages).
+    pub fn collection(&self, opts: CollectionQuery) -> Result<CollectionResponse> {
+        let (scope, schema_key, is_whole_vault) = normalize_collection_scope(&opts.path);
+
+        // 1. Gather + scope/depth filter.
+        let mut rows = self.gather_collection_rows(&scope, is_whole_vault, opts.recursive)?;
+
+        // 2. Metadata filter (reuses the search engine's MetadataFilter evaluation).
+        rows.retain(|row| {
+            let effective = effective_collection_frontmatter(row);
+            search::evaluate_filters(&opts.filters, Some(&effective))
+        });
+
+        // 3. Total count after filtering, before pagination.
+        let total_rows = rows.len();
+
+        // 4. Sort (type-aware, nulls-last; path-asc when no sort field).
+        sort_collection_rows(&mut rows, opts.sort_by.as_deref(), opts.order);
+
+        // 6 (computed before pagination): columns from the full filtered set so the
+        // layout stays stable across pages. Collect present keys + a representative
+        // non-null value per key for type inference of unscoped columns.
+        let mut present_keys: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut key_sample: HashMap<String, serde_json::Value> = HashMap::new();
+        for r in &rows {
+            let effective = effective_collection_frontmatter(r);
+            if let serde_json::Value::Object(map) = &effective {
+                for (k, v) in map {
+                    present_keys.insert(k.clone());
+                    if !v.is_null() {
+                        key_sample.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+            }
+        }
+        let columns =
+            self.build_collection_columns(&schema_key, is_whole_vault, &present_keys, &key_sample)?;
+
+        // 5. Paginate: skip offset, take limit (or all).
+        let limit = opts.limit.unwrap_or(usize::MAX);
+        let mut page: Vec<CollectionRow> = rows.into_iter().skip(opts.offset).take(limit).collect();
+
+        // 7. Populate relations for the RETURNED PAGE rows only (never the full
+        // filtered set); one RelationContext per call. `frontmatter` stays raw.
+        if opts.populate {
+            let ctx = self.relation_context();
+            for row in &mut page {
+                row.relations = Some(self.compute_relations(&row.path, &row.frontmatter, &ctx));
+            }
+        }
+
+        Ok(CollectionResponse {
+            scope,
+            recursive: opts.recursive,
+            columns,
+            rows: page,
+            total_rows,
+            limit: opts.limit,
+            offset: opts.offset,
+        })
+    }
+
+    /// Gather collection rows for a scope, classifying each file's sync state with
+    /// the same four-way logic as [`tree::build_file_tree`] (Indexed/Modified/New/
+    /// Deleted). `New` files are not parsed — they carry empty frontmatter.
+    fn gather_collection_rows(
+        &self,
+        scope: &str,
+        is_whole_vault: bool,
+        recursive: bool,
+    ) -> Result<Vec<CollectionRow>> {
+        let discovery = discovery::FileDiscovery::new(&self.root, &self.config);
+        let disk_files = discovery.discover()?;
+        let indexed_hashes: HashMap<String, String> = self.index.get_file_hashes();
+
+        let disk_paths: std::collections::HashSet<String> =
+            disk_files.iter().map(|p| path_util::to_slash(p)).collect();
+
+        // Scope + depth filter: prefix match, then (non-recursive) require the
+        // remainder after the prefix to be a direct child (no further `/`).
+        let in_scope = |path: &str| -> bool {
+            let remainder = if is_whole_vault {
+                path
+            } else {
+                if !path_util::path_is_in_scope(path, scope) {
+                    return false;
+                }
+                path.strip_prefix(scope.trim_end_matches('/'))
+                    .unwrap_or(path)
+                    .trim_start_matches('/')
+            };
+            recursive || !remainder.contains('/')
+        };
+
+        let mut rows = Vec::new();
+
+        // Classify disk files (Indexed / Modified / New).
+        for rel_path in &disk_paths {
+            if !in_scope(rel_path) {
+                continue;
+            }
+            if let Some(expected_hash) = indexed_hashes.get(rel_path) {
+                // On disk + in index → compare hashes (same as tree.rs).
+                let full_path = self.root.join(rel_path);
+                let content = std::fs::read_to_string(&full_path).map_err(|e| {
+                    Error::Io(std::io::Error::new(e.kind(), format!("{rel_path}: {e}")))
+                })?;
+                let disk_hash = parser::compute_content_hash(&content);
+                let state = if disk_hash == *expected_hash {
+                    tree::FileState::Indexed
+                } else {
+                    tree::FileState::Modified
+                };
+                rows.push(self.build_row_from_index(rel_path, state));
+            } else {
+                // On disk, not in index → New. Do not parse (no StoredFile in v1).
+                rows.push(self.build_new_row(rel_path));
+            }
+        }
+
+        // Deleted files: in index, not on disk.
+        for indexed_path in indexed_hashes.keys() {
+            if disk_paths.contains(indexed_path) {
+                continue;
+            }
+            if !in_scope(indexed_path) {
+                continue;
+            }
+            rows.push(self.build_row_from_index(indexed_path, tree::FileState::Deleted));
+        }
+
+        Ok(rows)
+    }
+
+    /// Build a row for a file present in the index (Indexed / Modified / Deleted).
+    fn build_row_from_index(&self, path: &str, state: tree::FileState) -> CollectionRow {
+        let stored = self.index.get_file(path);
+        let frontmatter = stored
+            .as_ref()
+            .and_then(|file| file.effective_frontmatter())
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let (title, title_source) = derive_title(path, &frontmatter);
+
+        CollectionRow {
+            path: path.to_string(),
+            title,
+            title_source,
+            frontmatter,
+            computed_fields: stored
+                .as_ref()
+                .map(|file| file.computed_values_json())
+                .unwrap_or_default(),
+            computed_field_errors: stored
+                .as_ref()
+                .map(|file| file.computed_errors_json())
+                .unwrap_or_default(),
+            content_hash: stored.as_ref().map(|f| f.content_hash.clone()),
+            file_size: stored.as_ref().map(|f| f.file_size).unwrap_or(0),
+            modified_at: self.index.get_file_mtime(path),
+            indexed_at: stored.as_ref().map(|f| f.indexed_at),
+            state,
+            relations: None,
+        }
+    }
+
+    /// Build a row for a file on disk but not in the index (New). Frontmatter is
+    /// empty (`{}`) — new files are not parsed in v1. `file_size`/`modified_at`
+    /// come from filesystem metadata; `content_hash`/`indexed_at` are `None`.
+    fn build_new_row(&self, path: &str) -> CollectionRow {
+        let full = self.root.join(path);
+        let meta = std::fs::metadata(&full).ok();
+        let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified_at = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        let frontmatter = serde_json::json!({});
+        let (title, title_source) = derive_title(path, &frontmatter);
+
+        CollectionRow {
+            path: path.to_string(),
+            title,
+            title_source,
+            frontmatter,
+            computed_fields: serde_json::Map::new(),
+            computed_field_errors: std::collections::BTreeMap::new(),
+            content_hash: None,
+            file_size,
+            modified_at,
+            indexed_at: None,
+            state: tree::FileState::New,
+            relations: None,
+        }
+    }
+
+    /// Build the column set: scoped-schema fields (`in_schema: true`) unioned with
+    /// frontmatter keys present in the filtered rows that the schema missed
+    /// (`in_schema: false`). Schema fields come first (already alphabetical), then
+    /// unscoped keys in sorted order.
+    fn build_collection_columns(
+        &self,
+        schema_key: &str,
+        is_whole_vault: bool,
+        present_keys: &std::collections::BTreeSet<String>,
+        key_sample: &HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<CollectionColumn>> {
+        // Whole-vault uses the global schema; a folder uses the scoped schema
+        // (persisted scoped_schemas preferred, on-the-fly inference as fallback).
+        let schema = if is_whole_vault {
+            self.schema()?
+        } else {
+            self.schema_scoped(schema_key)?.schema
+        };
+
+        let mut columns = Vec::with_capacity(schema.fields.len() + present_keys.len());
+        let mut schema_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for f in &schema.fields {
+            schema_names.insert(f.name.as_str());
+            columns.push(CollectionColumn {
+                name: f.name.clone(),
+                field_type: f.field_type.clone(),
+                description: f.description.clone(),
+                occurrence_count: f.occurrence_count,
+                sample_values: f.sample_values.clone(),
+                allowed_values: f.allowed_values.clone(),
+                required: f.required,
+                in_schema: true,
+                relation_target: f.relation_target.clone(),
+                formula: f.formula.clone(),
+                result_type: f.result_type,
+                relation_field: f.relation_field.clone(),
+                target_field: f.target_field.clone(),
+                relation_direction: f.relation_direction,
+                relation_scope: f.relation_scope.clone(),
+            });
+        }
+
+        // Present-but-unscoped keys, in sorted order (BTreeSet iterates sorted).
+        for key in present_keys {
+            if schema_names.contains(key.as_str()) {
+                continue;
+            }
+            let field_type = key_sample
+                .get(key)
+                .map(schema::infer_field_type)
+                .unwrap_or(schema::FieldType::String);
+            columns.push(CollectionColumn {
+                name: key.clone(),
+                field_type,
+                description: None,
+                occurrence_count: 0,
+                sample_values: Vec::new(),
+                allowed_values: None,
+                required: false,
+                in_schema: false,
+                relation_target: None,
+                formula: None,
+                result_type: None,
+                relation_field: None,
+                target_field: None,
+                relation_direction: None,
+                relation_scope: None,
+            });
+        }
+
+        Ok(columns)
+    }
+
+    /// Initialize a user-level config file at the given path.
+    ///
+    /// Creates parent directories if needed. Returns `Error::ConfigAlreadyExists`
+    /// if the file already exists.
+    pub fn init_global(config_path: &Path) -> Result<()> {
+        if config_path.exists() {
+            return Err(Error::ConfigAlreadyExists {
+                path: config_path.to_path_buf(),
+            });
+        }
+
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let template = "\
+# mdvdb user-level configuration
+# Values here apply to all projects unless overridden by project config.yaml
+# API credentials (OPENAI_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY,
+# AZURE_OPENAI_API_KEY, HF_TOKEN, AWS credentials) belong in .env, not here.
+
+# Default embedding provider
+# embedding:
+#   provider: openai
+#   model: text-embedding-3-small
+#   dimensions: auto
+";
+
+        std::fs::write(config_path, template)?;
+        info!(path = %config_path.display(), "created user-level config file");
+        Ok(())
+    }
+
+    /// Run diagnostic checks on the project configuration and index.
+    pub async fn doctor(&self) -> Result<DoctorResult> {
+        let mut checks = Vec::new();
+
+        // 1. Config loaded (always passes since we're already constructed).
+        checks.push(DoctorCheck {
+            name: "Config loaded".to_string(),
+            status: CheckStatus::Pass,
+            detail: format!(
+                "{:?} / {} / {}",
+                self.config.embedding_provider,
+                self.config.embedding_model,
+                self.config.embedding_dimensions
+            ),
+        });
+
+        // 2. User config existence.
+        match Config::user_config_path() {
+            Some(path) if path.is_file() => {
+                checks.push(DoctorCheck {
+                    name: "User config".to_string(),
+                    status: CheckStatus::Pass,
+                    detail: path.display().to_string(),
+                });
+            }
+            Some(path) => {
+                checks.push(DoctorCheck {
+                    name: "User config".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: format!("{} (not found)", path.display()),
+                });
+            }
+            None => {
+                checks.push(DoctorCheck {
+                    name: "User config".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: "home directory not resolved".to_string(),
+                });
+            }
+        }
+
+        // 3. Project config.
+        let project_config = self.root.join(".markdownvdb");
+        if project_config.is_dir() {
+            checks.push(DoctorCheck {
+                name: "Project config".to_string(),
+                status: CheckStatus::Pass,
+                detail: ".markdownvdb/".to_string(),
+            });
+        } else {
+            checks.push(DoctorCheck {
+                name: "Project config".to_string(),
+                status: CheckStatus::Fail,
+                detail: ".markdownvdb not found".to_string(),
+            });
+        }
+
+        // 4. API key.
+        match self.config.embedding_provider {
+            config::EmbeddingProviderType::OpenAI => {
+                if self.config.openai_api_key.is_some() {
+                    checks.push(DoctorCheck {
+                        name: "API key".to_string(),
+                        status: CheckStatus::Pass,
+                        detail: "OPENAI_API_KEY is set".to_string(),
+                    });
+                } else {
+                    checks.push(DoctorCheck {
+                        name: "API key".to_string(),
+                        status: CheckStatus::Fail,
+                        detail: "OPENAI_API_KEY not set".to_string(),
+                    });
+                }
+            }
+            config::EmbeddingProviderType::Mock => {
+                checks.push(DoctorCheck {
+                    name: "API key".to_string(),
+                    status: CheckStatus::Pass,
+                    detail: "mock provider (no key needed)".to_string(),
+                });
+            }
+            _ => {
+                checks.push(DoctorCheck {
+                    name: "API key".to_string(),
+                    status: CheckStatus::Pass,
+                    detail: format!("{:?} provider configured", self.config.embedding_provider),
+                });
+            }
+        }
+
+        // 5. Provider connectivity.
+        let start = std::time::Instant::now();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.ensure_provider()?.embed_batch(&["test".to_string()]),
+        )
+        .await
+        {
+            Ok(Ok(_vectors)) => {
+                let ms = start.elapsed().as_millis();
+                checks.push(DoctorCheck {
+                    name: "Provider reachable".to_string(),
+                    status: CheckStatus::Pass,
+                    detail: format!("OK ({ms}ms)"),
+                });
+            }
+            Ok(Err(e)) => {
+                checks.push(DoctorCheck {
+                    name: "Provider reachable".to_string(),
+                    status: CheckStatus::Fail,
+                    detail: e.to_string(),
+                });
+            }
+            Err(_) => {
+                checks.push(DoctorCheck {
+                    name: "Provider reachable".to_string(),
+                    status: CheckStatus::Fail,
+                    detail: "timeout (5s)".to_string(),
+                });
+            }
+        }
+
+        // 6. Index integrity.
+        let status = self.index.status();
+        if status.document_count == 0 && status.chunk_count == 0 && status.vector_count == 0 {
+            checks.push(DoctorCheck {
+                name: "Index".to_string(),
+                status: CheckStatus::Warn,
+                detail: "empty — run `mdvdb ingest` to index your markdown files".to_string(),
+            });
+        } else if status.vector_count == status.chunk_count + status.edge_count {
+            checks.push(DoctorCheck {
+                name: "Index".to_string(),
+                status: CheckStatus::Pass,
+                detail: format!(
+                    "{} docs, {} chunks, {} vectors ({} chunk + {} edge)",
+                    status.document_count,
+                    status.chunk_count,
+                    status.vector_count,
+                    status.chunk_count,
+                    status.edge_count
+                ),
+            });
+        } else {
+            checks.push(DoctorCheck {
+                name: "Index".to_string(),
+                status: CheckStatus::Warn,
+                detail: format!(
+                    "{} docs, {} chunks, {} vectors — expected {} chunk + {} edge = {} (mismatch)",
+                    status.document_count,
+                    status.chunk_count,
+                    status.vector_count,
+                    status.chunk_count,
+                    status.edge_count,
+                    status.chunk_count + status.edge_count
+                ),
+            });
+        }
+
+        // 7. Source directories.
+        let disco = discovery::FileDiscovery::new(&self.root, &self.config);
+        match disco.discover() {
+            Ok(files) => {
+                let dir_list: Vec<String> = self
+                    .config
+                    .source_dirs
+                    .iter()
+                    .map(|d| format!("{}/", d.display()))
+                    .collect();
+                checks.push(DoctorCheck {
+                    name: "Source directories".to_string(),
+                    status: CheckStatus::Pass,
+                    detail: format!("{} ({} .md files)", dir_list.join(" "), files.len()),
+                });
+            }
+            Err(e) => {
+                checks.push(DoctorCheck {
+                    name: "Source directories".to_string(),
+                    status: CheckStatus::Fail,
+                    detail: e.to_string(),
+                });
+            }
+        }
+
+        // 8. Relations: dangling relation targets, overlay target hygiene,
+        // and the unquoted-[[x]] YAML footgun. Warn (not Fail): broken
+        // references are vault content, not index health.
+        checks.push(self.doctor_relations_check());
+
+        // 9. Shards: malformed definitions and missing target folders are
+        // repairable configuration warnings, not collection/index failures.
+        checks.push(self.doctor_shards_check());
+
+        let passed = checks
+            .iter()
+            .filter(|c| c.status == CheckStatus::Pass)
+            .count();
+        let total = checks.len();
+
+        Ok(DoctorResult {
+            checks,
+            passed,
+            total,
+        })
+    }
+
+    /// Build the doctor "Relations" check: dangling relation edges (capped
+    /// examples), overlay `target:` folders matching no indexed file, and
+    /// frontmatter values that are unquoted `[[x]]` YAML nested arrays.
+    fn doctor_relations_check(&self) -> DoctorCheck {
+        const MAX_EXAMPLES: usize = 5;
+        let known: std::collections::HashSet<String> =
+            self.index.get_file_hashes().keys().cloned().collect();
+        let mut issues: Vec<String> = Vec::new();
+
+        // Dangling relation edges (field-tagged forward entries with unknown targets).
+        let mut relation_edge_count = 0usize;
+        let mut dangling: Vec<String> = Vec::new();
+        if let Some(graph) = self.index.get_link_graph() {
+            let mut entries: Vec<&links::LinkEntry> = graph
+                .forward
+                .values()
+                .flatten()
+                .filter(|e| e.field.is_some())
+                .collect();
+            entries.sort_by(|a, b| {
+                a.source
+                    .cmp(&b.source)
+                    .then_with(|| a.field.cmp(&b.field))
+                    .then_with(|| a.target.cmp(&b.target))
+            });
+            relation_edge_count = entries.len();
+            for entry in entries {
+                if !known.contains(&entry.target) {
+                    dangling.push(format!(
+                        "{}#{} → {}",
+                        entry.source,
+                        entry.field.as_deref().unwrap_or_default(),
+                        entry.target
+                    ));
+                }
+            }
+        }
+        if !dangling.is_empty() {
+            let total = dangling.len();
+            let mut examples = dangling;
+            examples.truncate(MAX_EXAMPLES);
+            let more = if total > MAX_EXAMPLES {
+                format!(", +{} more", total - MAX_EXAMPLES)
+            } else {
+                String::new()
+            };
+            issues.push(format!(
+                "{total} dangling relation(s): {}{more}",
+                examples.join(", ")
+            ));
+        }
+
+        // Overlay hygiene: declared target folders that prefix no indexed file.
+        if let Ok(Some(overlay)) = schema::Schema::load_overlay(&self.root) {
+            let mut targets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for field in overlay
+                .fields
+                .values()
+                .chain(overlay.scopes.values().flat_map(|s| s.fields.values()))
+            {
+                if let Some(t) = &field.target {
+                    let t = t.trim().trim_end_matches('/');
+                    if !t.is_empty() {
+                        targets.insert(t.to_string());
+                    }
+                }
+            }
+            let ghosts: Vec<String> = targets
+                .into_iter()
+                .filter(|target| {
+                    !known
+                        .iter()
+                        .any(|path| path_util::path_is_in_scope(path, target))
+                })
+                .collect();
+            if !ghosts.is_empty() {
+                issues.push(format!(
+                    "overlay target folder(s) match no indexed file: {}",
+                    ghosts.join(", ")
+                ));
+            }
+        }
+
+        // Unquoted-[[x]] footgun: a value parsed as a nested single-string array
+        // whose inner string would be link-shaped if the value had been quoted.
+        let mut unquoted: Vec<String> = Vec::new();
+        let mut paths: Vec<String> = known.iter().cloned().collect();
+        paths.sort();
+        'files: for path in &paths {
+            let Some(fm) = self
+                .index
+                .get_file(path)
+                .and_then(|file| file.effective_frontmatter())
+            else {
+                continue;
+            };
+            let Some(map) = fm.as_object() else { continue };
+            for (field, value) in map {
+                let serde_json::Value::Array(outer) = value else {
+                    continue;
+                };
+                let [serde_json::Value::Array(inner)] = outer.as_slice() else {
+                    continue;
+                };
+                let [serde_json::Value::String(s)] = inner.as_slice() else {
+                    continue;
+                };
+                if relations::is_link_shaped(&format!("[[{s}]]")) {
+                    unquoted.push(format!("{path}#{field}"));
+                    if unquoted.len() >= MAX_EXAMPLES {
+                        break 'files;
+                    }
+                }
+            }
+        }
+        if !unquoted.is_empty() {
+            issues.push(format!(
+                "unquoted [[..]] value(s) parse as YAML nested lists (quote them to make relations): {}",
+                unquoted.join(", ")
+            ));
+        }
+
+        if issues.is_empty() {
+            let detail = if relation_edge_count == 0 {
+                "no relation links".to_string()
+            } else {
+                format!("{relation_edge_count} relation link(s), all targets resolve")
+            };
+            DoctorCheck {
+                name: "Relations".to_string(),
+                status: CheckStatus::Pass,
+                detail,
+            }
+        } else {
+            DoctorCheck {
+                name: "Relations".to_string(),
+                status: CheckStatus::Warn,
+                detail: issues.join("; "),
+            }
+        }
+    }
+
+    fn doctor_shards_check(&self) -> DoctorCheck {
+        let store = shards::ShardStore::new(&self.root);
+        match store.list() {
+            Err(error) => DoctorCheck {
+                name: "Shards".to_string(),
+                status: CheckStatus::Warn,
+                detail: format!("invalid Shard definitions: {error}"),
+            },
+            Ok(list) => {
+                let malformed_topics: Vec<_> = list
+                    .shards
+                    .iter()
+                    .filter_map(|shard| {
+                        store
+                            .topics(&shard.id)
+                            .err()
+                            .map(|error| format!("{}: {}", shard.id, error))
+                    })
+                    .collect();
+                let missing: Vec<_> = list.shards.iter().filter(|shard| !shard.exists).collect();
+                if missing.is_empty() && malformed_topics.is_empty() {
+                    let detail = if list.total_shards == 0 {
+                        "no Shards configured".to_string()
+                    } else {
+                        format!(
+                            "{} Shard(s) configured, all folders exist",
+                            list.total_shards
+                        )
+                    };
+                    DoctorCheck {
+                        name: "Shards".to_string(),
+                        status: CheckStatus::Pass,
+                        detail,
+                    }
+                } else {
+                    let missing_paths = missing
+                        .iter()
+                        .map(|shard| format!("{} ({})", shard.id, shard.path))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut issues = Vec::new();
+                    if !missing.is_empty() {
+                        issues.push(format!(
+                            "{} missing folder(s): {}",
+                            missing.len(),
+                            missing_paths
+                        ));
+                    }
+                    if !malformed_topics.is_empty() {
+                        issues.push(format!(
+                            "{} malformed local Topic definition(s): {}",
+                            malformed_topics.len(),
+                            malformed_topics.join(", ")
+                        ));
+                    }
+                    DoctorCheck {
+                        name: "Shards".to_string(),
+                        status: CheckStatus::Warn,
+                        detail: format!(
+                            "{} Shard(s) configured; {}",
+                            list.total_shards,
+                            issues.join("; ")
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Normalize a collection scope path into `(scope, schema_key, is_whole_vault)`.
+///
+/// - Trims surrounding whitespace and a leading `./`.
+/// - `""`, `"."`, and `"./"` resolve to the whole-vault scope: `scope = "."`,
+///   `schema_key = ""`, `is_whole_vault = true`.
+/// - Otherwise a trailing `/` is appended for segment-safe prefix matching:
+///   `"blog"` / `"blog/"` → `scope = "blog/"`, `schema_key = "blog"`.
+///
+/// `scope` is used for prefix matching and echoed in the response; `schema_key`
+/// (no trailing slash) is the form that matches persisted `scoped_schemas`.
+fn normalize_collection_scope(path: &str) -> (String, String, bool) {
+    let normalized = path_util::normalize_path_input(path);
+    let raw = normalized.trim();
+    let raw = raw.strip_prefix("./").unwrap_or(raw);
+    let raw = raw.trim_end_matches('/');
+
+    if raw.is_empty() || raw == "." {
+        (".".to_string(), String::new(), true)
+    } else {
+        (format!("{raw}/"), raw.to_string(), false)
+    }
+}
+
+/// Derive a display title for a collection row.
+///
+/// v1 rule: use a non-empty `frontmatter.title` string ([`TitleSource::Frontmatter`]),
+/// otherwise the filename stem of `path` ([`TitleSource::Filename`]). The stem is
+/// the last path segment with a `.md`/`.markdown` extension removed; a `.md` file
+/// always has a non-empty stem, so the result is guaranteed non-empty.
+fn derive_title(path: &str, frontmatter: &serde_json::Value) -> (String, TitleSource) {
+    if let Some(serde_json::Value::String(s)) = frontmatter.get("title") {
+        if !s.trim().is_empty() {
+            return (s.clone(), TitleSource::Frontmatter);
+        }
+    }
+
+    let last = path.rsplit('/').next().unwrap_or(path);
+    // Strip a `.md`/`.markdown` extension, but never down to an empty string:
+    // a dotfile named exactly ".md"/".markdown" keeps its full name so the title
+    // is always non-empty (per the contract guarantee).
+    let stem = match last
+        .strip_suffix(".markdown")
+        .or_else(|| last.strip_suffix(".md"))
+    {
+        Some(s) if !s.is_empty() => s,
+        _ => last,
+    };
+    (stem.to_string(), TitleSource::Filename)
+}
+
+/// Return the already ownership-filtered frontmatter used by collection
+/// filtering and sorting. Indexed rows are built through
+/// [`StoredFile::effective_frontmatter`], which hides diagnostics that still
+/// own their materialized key while preserving ordinary keys reclaimed after
+/// an invalid/missing-schema cleanup tombstone released ownership.
+fn effective_collection_frontmatter(row: &CollectionRow) -> serde_json::Value {
+    row.frontmatter.clone()
+}
+
+/// Sort collection rows in place.
+///
+/// When `sort_by` is `None`, sorts by `path` ascending for deterministic output.
+/// Otherwise sorts by `frontmatter[sort_by]` using [`search::compare_json_for_sort`]
+/// (type-aware), with a strict **nulls-last** rule: a row whose value is missing
+/// or `null` sorts after all non-null rows in BOTH directions. Ties (and nulls)
+/// are broken by `path` ascending.
+fn sort_collection_rows(rows: &mut [CollectionRow], sort_by: Option<&str>, order: SortOrder) {
+    let Some(field) = sort_by else {
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        return;
+    };
+
+    rows.sort_by(|a, b| {
+        let a_effective = effective_collection_frontmatter(a);
+        let b_effective = effective_collection_frontmatter(b);
+        let av = a_effective.get(field).filter(|v| !v.is_null());
+        let bv = b_effective.get(field).filter(|v| !v.is_null());
+        match (av, bv) {
+            (None, None) => a.path.cmp(&b.path),
+            (None, Some(_)) => std::cmp::Ordering::Greater, // a is null → after
+            (Some(_), None) => std::cmp::Ordering::Less,    // b is null → a before
+            (Some(av), Some(bv)) => {
+                let ord = search::compare_json_for_sort(av, bv);
+                let ord = match order {
+                    SortOrder::Asc => ord,
+                    SortOrder::Desc => ord.reverse(),
+                };
+                ord.then_with(|| a.path.cmp(&b.path))
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod collection_unit_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row(path: &str, frontmatter: serde_json::Value) -> CollectionRow {
+        let (title, title_source) = derive_title(path, &frontmatter);
+        CollectionRow {
+            path: path.to_string(),
+            title,
+            title_source,
+            frontmatter,
+            computed_fields: serde_json::Map::new(),
+            computed_field_errors: std::collections::BTreeMap::new(),
+            content_hash: None,
+            file_size: 0,
+            modified_at: None,
+            indexed_at: None,
+            state: tree::FileState::Indexed,
+            relations: None,
+        }
+    }
+
+    #[test]
+    fn collection_effective_frontmatter_preserves_a_reclaimed_ordinary_key() {
+        let mut row = row("notes/reclaimed.md", json!({"legacy": 7}));
+        row.computed_field_errors.insert(
+            "legacy".to_string(),
+            ComputedFieldDiagnostic {
+                module: formula::FORMULA_MODULE_ID.to_string(),
+                field: "legacy".to_string(),
+                code: "invalid_schema".to_string(),
+                message: "released cleanup tombstone".to_string(),
+                span_start: None,
+                span_end: None,
+            },
+        );
+
+        assert_eq!(effective_collection_frontmatter(&row)["legacy"], 7);
+    }
+
+    // --- normalize_collection_scope ---
+
+    #[test]
+    fn normalize_whole_vault_variants() {
+        for input in ["", ".", "./", "  ", "  .  ", "./", "/"] {
+            let (scope, key, whole) = normalize_collection_scope(input);
+            assert!(whole, "input {input:?} should be whole-vault");
+            assert_eq!(scope, ".");
+            assert_eq!(key, "");
+        }
+    }
+
+    #[test]
+    fn normalize_folder_appends_trailing_slash() {
+        let (scope, key, whole) = normalize_collection_scope("blog");
+        assert!(!whole);
+        assert_eq!(scope, "blog/");
+        assert_eq!(key, "blog");
+
+        let (scope, key, _) = normalize_collection_scope("blog/");
+        assert_eq!(scope, "blog/");
+        assert_eq!(key, "blog");
+
+        let (scope, key, _) = normalize_collection_scope("./blog");
+        assert_eq!(scope, "blog/");
+        assert_eq!(key, "blog");
+
+        let (scope, key, _) = normalize_collection_scope("blog/2024/");
+        assert_eq!(scope, "blog/2024/");
+        assert_eq!(key, "blog/2024");
+    }
+
+    // --- derive_title ---
+
+    #[test]
+    fn derive_title_prefers_frontmatter() {
+        let (title, src) = derive_title("blog/launch.md", &json!({"title": "Launch Announcement"}));
+        assert_eq!(title, "Launch Announcement");
+        assert_eq!(src, TitleSource::Frontmatter);
+    }
+
+    #[test]
+    fn derive_title_falls_back_to_stem() {
+        let (title, src) = derive_title("blog/2024/my-post.md", &json!({}));
+        assert_eq!(title, "my-post");
+        assert_eq!(src, TitleSource::Filename);
+
+        // .markdown extension
+        let (title, src) = derive_title("notes/idea.markdown", &json!({}));
+        assert_eq!(title, "idea");
+        assert_eq!(src, TitleSource::Filename);
+    }
+
+    #[test]
+    fn derive_title_ignores_empty_or_non_string_title() {
+        // Empty/whitespace title → stem.
+        let (title, src) = derive_title("a/b.md", &json!({"title": "   "}));
+        assert_eq!(title, "b");
+        assert_eq!(src, TitleSource::Filename);
+        // Non-string title → stem.
+        let (title, src) = derive_title("a/c.md", &json!({"title": 42}));
+        assert_eq!(title, "c");
+        assert_eq!(src, TitleSource::Filename);
+    }
+
+    #[test]
+    fn derive_title_never_empty() {
+        let (title, _) = derive_title("readme.md", &json!({}));
+        assert_eq!(title, "readme");
+        assert!(!title.is_empty());
+    }
+
+    #[test]
+    fn derive_title_extension_only_filename_stays_non_empty() {
+        // A dotfile named exactly ".md"/".markdown" has no real stem; the title
+        // must still be non-empty (contract guarantee), so we keep the full name.
+        let (title, src) = derive_title(".md", &json!({}));
+        assert_eq!(title, ".md");
+        assert_eq!(src, TitleSource::Filename);
+
+        let (title, _) = derive_title("sub/.markdown", &json!({}));
+        assert_eq!(title, ".markdown");
+
+        // And the title is non-empty for these pathological inputs.
+        assert!(!derive_title(".md", &json!({})).0.is_empty());
+        assert!(!derive_title("a/b/.markdown", &json!({})).0.is_empty());
+    }
+
+    // --- sort_collection_rows: nulls-last in both directions ---
+
+    #[test]
+    fn sort_nulls_last_ascending() {
+        let mut rows = vec![
+            row("c.md", json!({})), // null (missing)
+            row("a.md", json!({"order": 2})),
+            row("b.md", json!({"order": 1})),
+            row("d.md", json!({"order": serde_json::Value::Null})), // explicit null
+        ];
+        sort_collection_rows(&mut rows, Some("order"), SortOrder::Asc);
+        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        // non-null first (1 then 2), nulls last tie-broken by path asc (c, d)
+        assert_eq!(paths, vec!["b.md", "a.md", "c.md", "d.md"]);
+    }
+
+    #[test]
+    fn sort_nulls_last_descending() {
+        let mut rows = vec![
+            row("c.md", json!({})),
+            row("a.md", json!({"order": 2})),
+            row("b.md", json!({"order": 1})),
+        ];
+        sort_collection_rows(&mut rows, Some("order"), SortOrder::Desc);
+        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        // desc among non-null (2 then 1), null still LAST
+        assert_eq!(paths, vec!["a.md", "b.md", "c.md"]);
+    }
+
+    #[test]
+    fn sort_by_path_when_no_field() {
+        let mut rows = vec![
+            row("zebra.md", json!({})),
+            row("alpha.md", json!({})),
+            row("mango.md", json!({})),
+        ];
+        sort_collection_rows(&mut rows, None, SortOrder::Asc);
+        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["alpha.md", "mango.md", "zebra.md"]);
+    }
+
+    #[test]
+    fn sort_numeric_not_lexicographic() {
+        let mut rows = vec![
+            row("a.md", json!({"n": 10})),
+            row("b.md", json!({"n": 2})),
+            row("c.md", json!({"n": 1})),
+        ];
+        sort_collection_rows(&mut rows, Some("n"), SortOrder::Asc);
+        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["c.md", "b.md", "a.md"]);
+    }
+}

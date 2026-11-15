@@ -1,0 +1,388 @@
+# Markdown VDB — Implementation Roadmap
+
+A filesystem-native vector database built entirely around Markdown files. Zero infrastructure, markdown-first, optimized for AI agent access.
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Agent Interface                       │
+│              CLI (clap) + Library API                    │
+│         mdvdb search | ingest | status | watch          │
+├──────────┬──────────┬───────────┬───────────────────────┤
+│  Search  │  Schema  │ Clustering│   File Watcher        │
+│  Engine  │  System  │  (linfa)  │   (notify)            │
+├──────────┴──────────┴───────────┴───────────────────────┤
+│                   Index Storage                         │
+│        usearch (HNSW) + rkyv (metadata) + memmap2       │
+│          parking_lot::RwLock (concurrency)               │
+├──────────┬──────────────────────────────────────────────┤
+│ Embedding│   OpenAI | Ollama | Custom (reqwest)         │
+│ Providers│   Batch processing + content-hash skip       │
+├──────────┴──────────────────────────────────────────────┤
+│                  Chunking Engine                        │
+│      Heading-split + token size guard (tiktoken-rs)     │
+├─────────────────────────────────────────────────────────┤
+│              Markdown Parsing & Discovery                │
+│    pulldown-cmark + serde_yaml + ignore + sha2          │
+├─────────────────────────────────────────────────────────┤
+│               Foundation & Configuration                │
+│         dotenvy + thiserror + anyhow + tracing          │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Technology Stack
+
+| Layer | Crate | Purpose |
+|---|---|---|
+| Runtime | `tokio` | Async I/O for embeddings, file watching |
+| CLI | `clap` | Derive-based subcommands, completions |
+| Markdown | `pulldown-cmark` | Streaming heading-aware parsing |
+| Frontmatter | `serde_yaml` | Dynamic YAML → JSON metadata |
+| Tokenizer | `tiktoken-rs` | Accurate token counting for chunks |
+| Embeddings | `reqwest` | HTTP client for OpenAI/Ollama APIs |
+| Vectors | `usearch` | Sub-ms HNSW nearest neighbor search |
+| Serialization | `rkyv` | Zero-copy deserialization from mmap |
+| Memory mapping | `memmap2` | On-demand index loading via OS page cache |
+| File watching | `notify` | Cross-platform FS events + debouncing |
+| Concurrency | `parking_lot` | Fast RwLock for read-heavy workloads |
+| Clustering | `linfa` | K-means + nearest-centroid assignment |
+| Async streams | `futures` | Concurrent batch embedding |
+| File scanning | `ignore` | Gitignore-native directory traversal |
+| Hashing | `sha2` | Content change detection |
+| Config | `dotenvy` | Dotenv-style `.markdownvdb` + `.env` config |
+| Errors | `thiserror` / `anyhow` | Typed lib errors, ergonomic CLI errors |
+
+---
+
+## Sprint 1 — Core Engine (Phases 1–10) ✅
+
+All 10 phases complete.
+
+### Phase 1 — Foundation & Configuration ✅
+> [phase-1-foundation-config.md](phase-1-foundation-config.md)
+
+Bootstrap the Rust project. Config system reads `.markdownvdb` dotenv files with shell env overrides and built-in defaults. Error hierarchy and structured logging established.
+
+### Phase 2 — Markdown Parsing & File Discovery ✅
+> [phase-2-markdown-parsing.md](phase-2-markdown-parsing.md)
+
+Recursive file scanner with layered ignore rules (`.gitignore` + 15 built-in patterns + user custom). Markdown parser extracts frontmatter, heading structure, and body content. SHA-256 content hashing for change detection.
+
+### Phase 3 — Chunking Engine ✅
+> [phase-3-chunking-engine.md](phase-3-chunking-engine.md)
+
+Hybrid chunking: primary split by headings (preserving document structure), secondary split by token count for oversized sections with configurable overlap. Each chunk carries heading hierarchy breadcrumb and line range.
+
+### Phase 4 — Embedding Provider System ✅
+> [phase-4-embedding-providers.md](phase-4-embedding-providers.md)
+
+Pluggable `EmbeddingProvider` trait with OpenAI and Ollama implementations. Concurrent batch processing (up to 4 simultaneous API calls). Content-hash comparison skips re-embedding unchanged files.
+
+### Phase 5 — Index Storage & Memory Mapping ✅
+> [phase-5-index-storage.md](phase-5-index-storage.md)
+
+Single portable index file: `[header][rkyv metadata][usearch HNSW vectors]`. Memory-mapped via memmap2 for fast on-demand loading. usearch HNSW for sub-millisecond vector search. Concurrent access via parking_lot RwLock.
+
+### Phase 6 — Semantic Search & Metadata Filtering ✅
+> [phase-6-semantic-search.md](phase-6-semantic-search.md)
+
+Query pipeline: embed query → HNSW nearest neighbors → metadata filter → section-level results. Filters support exact match, list membership, numeric range, and field existence. Builder-pattern query construction.
+
+### Phase 7 — Metadata Schema System ✅
+> [phase-7-metadata-schema.md](phase-7-metadata-schema.md)
+
+Auto-infer schema from frontmatter (field names, types, sample values). Optional `.markdownvdb.schema.yml` overlay for annotations, type overrides, and allowed values. Schema persisted in index and updated during ingest and watch events.
+
+### Phase 8 — File Watching & Incremental Updates ✅
+> [phase-8-file-watching.md](phase-8-file-watching.md)
+
+Filesystem watcher with debouncing. On change: hash comparison → parse → chunk → embed → upsert → schema inference. Stale entry cleanup. Full ingest pipeline with clustering integration.
+
+### Phase 9 — Clustering ✅
+> [phase-9-clustering.md](phase-9-clustering.md)
+
+K-means clustering on document-level vectors (averaged chunk vectors per file). Integrated into ingest pipeline. Incremental nearest-centroid assignment for single-file ingests. Cross-cluster TF-IDF keyword extraction. Auto-generated labels.
+
+### Phase 10 — Agent Interface (CLI + Library) ✅
+> [phase-10-cli-library.md](phase-10-cli-library.md)
+
+Full CLI: `mdvdb search|ingest|status|schema|clusters|get|watch|init`. Wrapped JSON output for agents, human-readable fallback. Library API via `MarkdownVdb` struct. 14 CLI tests + 9 API tests.
+
+---
+
+## Sprint 1.5 — Polish (Phase 11) ✅
+
+### Phase 11 — Environment Variable & Config Loading ✅
+> **Status: Complete**
+> [phase-11-environment-vars-and-config.md](phase-11-environment-vars-and-config.md)
+
+`.env` file loaded as fallback config source. Priority: shell env > `.markdownvdb` > `.env` > defaults. Shared secrets like `OPENAI_API_KEY` live in `.env` (gitignored) and are picked up automatically.
+
+---
+
+## Sprint 2 — CLI Polish & Search Power (Phases 12–17) ✅
+
+### Phase 12 — Making CLI Great ✅
+> [phase-12-cli-great.md](phase-12-cli-great.md)
+
+Transform the CLI from plain text into a polished terminal experience. New `src/format.rs` module centralizes all human-readable formatting with colored output, ASCII art branding, score bars, distribution bars, progress spinners (`indicatif`), and humanized values ("2 hours ago", "1.5 MB"). TTY-aware with `--no-color` flag and `NO_COLOR` env var support. JSON output remains completely untouched.
+
+**New crate dependencies:** `colored`, `indicatif`
+
+**Key additions:**
+- ASCII logo for `mdvdb` with no subcommand and `--version`
+- Score bars next to search results, distribution bars for clusters, occurrence bars for schema
+- Progress spinner during ingest (TTY only)
+- Humanized timestamps and file sizes in human output
+- Surface cluster keywords, document frontmatter, and file metadata that were previously JSON-only
+
+---
+
+### Phase 13 — File Tree Index & Path-Scoped Search ✅
+> [phase-13-file-tree-path-scoped-search.md](phase-13-file-tree-path-scoped-search.md)
+
+New `mdvdb tree` command showing ASCII tree view of indexed documents with colored file-state indicators (indexed/modified/new/deleted). Path-scoped search via `--path docs/api/` restricts results to a directory subtree. `path_components` field added to search results for hierarchical context. All computed on-the-fly from existing index data — no new stored structures.
+
+**No new crate dependencies.** Uses `sha2` (existing) for hash comparison and `std::io::IsTerminal` for TTY detection.
+
+**Key additions:**
+- `mdvdb tree [--path <prefix>] [--json]` — file tree with state indicators
+- `mdvdb search --path <prefix>` — restrict search to subtree
+- `path_components: Vec<String>` on `SearchResultFile`
+- `vdb.file_tree()` library API method
+- New `src/tree.rs` module with `FileState`, `FileTreeNode`, `FileTree` types
+
+---
+
+### Phase 14 — Hybrid Search (Semantic + Lexical BM25) ✅
+> [phase-14-hybrid-search.md](phase-14-hybrid-search.md)
+
+Add fast BM25 lexical search via Tantivy alongside existing HNSW semantic search, combined through Reciprocal Rank Fusion (RRF). Default mode is hybrid (both signals). Lexical-only mode works without any API key — pure local, sub-millisecond search.
+
+**New crate dependency:** `tantivy = "0.22"`
+
+**Key additions:**
+- New `src/fts.rs` module wrapping Tantivy — schema, upsert, remove, search, commit
+- `.markdownvdb.fts/` directory for Tantivy segment files (separate from binary index)
+- `SearchMode` enum: `Hybrid` (default), `Semantic`, `Lexical`
+- CLI flags: `--mode hybrid|semantic|lexical` + shorthand `--semantic`/`--lexical`
+- RRF fusion: `score(doc) = Σ 1/(k + rank)` with k=60 (industry standard)
+- Markdown stripping via `pulldown-cmark` before FTS indexing
+- Heading hierarchy boosted 1.5x in BM25 scoring
+- Config: `MDVDB_SEARCH_MODE`, `MDVDB_FTS_INDEX_DIR`, `MDVDB_SEARCH_RRF_K`
+
+---
+
+### Phase 15 — Link Graph & Backlinks ✅
+> [phase-15-link-graph.md](phase-15-link-graph.md)
+
+Extract internal markdown links (`[text](path.md)` and `[[wikilinks]]`) during parsing to build a persistent link graph. Backlink queries, orphan detection, broken link checking, and optional link-aware search boosting. Three new CLI commands: `links`, `backlinks`, `orphans`.
+
+**No new crate dependencies.** Uses `pulldown-cmark` (existing) for link extraction.
+
+**Key additions:**
+- Link extraction in parser: `[text](path.md)` + `[[wikilink]]` syntax
+- `LinkGraph` stored in `IndexMetadata` (follows Schema/ClusterState pattern)
+- `mdvdb links <file>` — outgoing links + incoming backlinks with tree rendering
+- `mdvdb backlinks <file>` — files that link TO this file
+- `mdvdb orphans` — files with no links in or out
+- `mdvdb search --boost-links` — boost results that are link neighbors of top hits
+- Broken link detection with `[broken]` state badges
+- New `src/links.rs` module with `LinkGraph`, `LinkEntry`, `ResolvedLink`, `LinkState` types
+
+---
+
+### Phase 16 — Settings in User Location ✅
+> [phase-16-settings-user-location.md](phase-16-settings-user-location.md)
+
+User-level config at `~/.mdvdb/config`. Priority: shell env > project `.markdownvdb/.config` > legacy `.markdownvdb` > `.env` > `~/.mdvdb/config` > defaults. `MDVDB_NO_USER_CONFIG` to disable.
+
+---
+
+### Phase 17 — Interactive Ingest Progress ✅
+> [phase-17-interactive-ingest-progress.md](phase-17-interactive-ingest-progress.md)
+
+Rich interactive progress display during ingestion. Renames `--full` to `--reindex`, adds `--preview` dry-run mode, graceful Ctrl+C cancellation, live file status in watch mode.
+
+---
+
+## Sprint 3 — Search Intelligence (Phase 18+) ✅
+
+### Phase 18 — Time Decay for Search Results ✅
+> [phase-18-time-decay.md](phase-18-time-decay.md)
+
+Optional time-based decay multiplier for search scores, favoring recently edited files. Exponential half-life formula: `score * 0.5^(elapsed_days / half_life_days)`. Disabled by default, configurable via `MDVDB_SEARCH_DECAY` and `MDVDB_SEARCH_DECAY_HALF_LIFE`. CLI flags: `--decay`, `--no-decay`, `--decay-half-life <DAYS>`. Works across all three search modes.
+
+**No new crate dependencies.** Uses existing `std::fs::metadata` for file mtime capture.
+
+**Key additions:**
+- File modification time (`mtime`) captured during parsing and stored in `IndexMetadata`
+- `apply_time_decay()` function with configurable half-life (default 90 days)
+- `--decay` / `--no-decay` / `--decay-half-life` CLI flags
+- `modified_at` field in search results JSON output
+- Config: `MDVDB_SEARCH_DECAY`, `MDVDB_SEARCH_DECAY_HALF_LIFE`
+
+---
+
+## Sprint 4 — Semantic Graph & Scoped Schema (Phases 22–23)
+
+### Phase 22 — Semantic Edges (Auto-Inferred Graph RAG)
+> [phase-22-semantic-edges.md](phase-22-semantic-edges.md)
+
+Transform the flat link graph into a semantically-rich knowledge graph. Extract paragraph-level context around every internal link, embed it alongside chunk vectors, and globally cluster all edge embeddings via K-means to auto-discover relationship types. Edge-weighted search boosting replaces the flat link boost with `cosine(query_embedding, edge_embedding)` modulation. New edge-first retrieval mode (`--edge-search`) and `mdvdb edges` CLI command.
+
+**Key additions:**
+- Paragraph-level link context extraction during parsing
+- Edge embeddings stored in shared HNSW index with `"edge:"` ID prefix
+- Global K-means clustering of edge embeddings to auto-discover relationship types
+- Edge-weighted search boost replacing flat BFS multiplier
+- `SearchMode::Edge` — edge-first retrieval: search edges, return connected documents
+- `mdvdb edges <file>` CLI command
+- `mdvdb search --edge-search` flag
+
+### Phase 22 (App) — Semantic Edge Visualization
+> [app/phase-22-semantic-edge-visualization.md](app/phase-22-semantic-edge-visualization.md)
+
+Visualize auto-inferred semantic edges in the Electron app's graph views. Edges gain variable thickness (by strength), color (by relationship cluster), dashed/solid styling, hover tooltips with context text, and a clickable edge-type legend for filtering. Consumes extended `GraphData` JSON from the Rust backend.
+
+**Key additions:**
+- Variable edge thickness based on relationship strength (0–1)
+- Edge coloring by auto-discovered relationship cluster (pastel palette)
+- Dashed lines for weak edges below configurable threshold
+- Edge hover tooltips with relationship type, strength bar, and context excerpt
+- Edge-type legend with click-to-filter in graph panel
+- Graceful degradation when semantic edge data is absent
+
+### Phase 23 — Path-Scoped Schema
+> [phase-23-scoped-schema.md](phase-23-scoped-schema.md)
+
+Extend the schema system to support path-scoped schemas — separate inferences per directory subtree alongside the global schema. Scopes are auto-discovered from top-level directories and optionally refined via `.markdownvdb.schema.yml`. Scoped queries return global fields + matching scope fields with more-specific scopes overriding broader ones.
+
+**Key additions:**
+- Auto-discover scopes from top-level directories
+- Explicit scope configuration in `.markdownvdb.schema.yml` with `scopes:` section
+- Union resolution: scoped fields override global fields
+- `mdvdb schema --path blog/` for scoped schema queries
+- `MarkdownVdb::schema_scoped(path_prefix)` library API
+- Index version bump (v1 → v2), requiring `mdvdb ingest --full` for existing indexes
+
+### Phase 23 (App) — Schema-Aware Frontmatter Editor
+> [app/phase-23-frontmatter-suggestions.md](app/phase-23-frontmatter-suggestions.md)
+
+Make the app's FrontmatterEditor schema-aware with field name suggestions, value autocomplete, constrained dropdowns for fields with allowed values, description tooltips, and required field indicators. Uses path-scoped schema from core Phase 23 for directory-aware suggestions.
+
+**Key additions:**
+- Field name suggestions when adding new frontmatter properties
+- Value autocomplete for text fields using `sample_values`
+- Constrained `<select>` dropdowns for fields with `allowed_values`
+- Tag autocomplete for array fields
+- Description tooltips and required field indicators (`*`)
+- Scoped suggestions based on the open file's directory
+
+---
+
+## Sprint 5 — Discovery & Filtering (Phase 24)
+
+### Phase 24 — `.mdvdbignore` File Support
+> [phase-24-mdvdbignore.md](phase-24-mdvdbignore.md)
+
+Project-local `.mdvdbignore` file using `.gitignore` syntax to exclude files from the index without removing them from git. Nested files scope to their subtree. Parsed via the `ignore` crate — zero new dependencies.
+
+**No new crate dependencies.** Uses `ignore` (existing) for custom ignore filename support.
+
+**Key additions:**
+- `.mdvdbignore` file support with full `.gitignore` syntax (globs, negation, comments)
+- Automatic reading during both `discover()` and `should_index()` (watcher)
+- Composes with `.gitignore`, built-in ignores, and `MDVDB_IGNORE_PATTERNS`
+
+---
+
+## Dependency Graph
+
+```
+  ┌───┐
+  │ 1 │ Foundation & Config
+  └─┬─┘
+    │
+  ┌─▼─┐
+  │ 2 │ Parsing & Discovery
+  └─┬─┘
+    │
+  ┌─▼─┐
+  │ 3 │ Chunking Engine
+  └─┬─┘
+    │
+  ┌─▼─┐
+  │ 4 │ Embedding Providers
+  └─┬─┘
+    │
+  ┌─▼─┐
+  │ 5 │ Index Storage ◄────────────────────┐
+  └─┬─┘                                    │
+    │                                       │
+  ┌─▼─┐   ┌───┐                          ┌─┴─┐
+  │ 6 │   │ 7 │ Schema (uses 2,5)        │ 9 │ Clustering (uses 5)
+  └─┬─┘   └─┬─┘                          └─┬─┘
+    │        │        ┌───┐                 │
+    │        │        │ 8 │ Watcher         │
+    │        │        └─┬─┘ (uses 2-5)     │
+    │        │          │                   │
+  ┌─▼────────▼──────────▼───────────────────▼─┐
+  │                   10                       │
+  │          CLI + Library Interface            │
+  └──────────────┬──────────────────────────┘
+                 │
+               ┌─▼──┐
+               │ 11 │ Config (.env fallback)
+               └─┬──┘
+                 │
+               ┌─▼──┐
+               │ 12 │ CLI Polish (format.rs, colors, spinners)
+               └─┬──┘
+                 │
+          ┌──────┼──────┐
+        ┌─▼──┐ ┌─▼──┐ ┌─▼──┐
+        │ 13 │ │ 14 │ │ 15 │ Link Graph
+        │Tree│ │BM25│ │    │ (uses 2, 5)
+        └────┘ └─┬──┘ └────┘
+                 │
+               ┌─▼──┐
+               │ 18 │ Time Decay
+               │    │ (uses 6, 14)
+               └─┬──┘
+                 │
+          ┌──────┴──────┐
+        ┌─▼──┐        ┌─▼──┐
+        │ 22 │        │ 23 │ Scoped Schema
+        │Edge│        │    │ (uses 7)
+        │    │        └─┬──┘
+        └─┬──┘          │
+          │           ┌─▼──────┐
+        ┌─▼──────┐    │ 23 App │ Frontmatter
+        │ 22 App │    │        │ Editor
+        │  Edge  │    └────────┘
+        │  Viz   │
+        └────────┘
+```
+
+**Sprint 1 critical path:** 1 → 2 → 3 → 4 → 5 → 6 → 10 ✅
+**Sprint 1.5:** 11 (config polish) ✅
+**Sprint 2:** 12 first (CLI formatting used by 13+). 13, 14, and 15 are independent of each other after 12.
+**Sprint 4:** 22 depends on 15 (link graph) + 4 (embeddings). 23 depends on 7 (schema). App phases depend on their core counterparts.
+
+---
+
+## Execution
+
+To implement any phase:
+
+```
+/execute-prd docs/prds/phase-N-<name>.md
+```
+
+Each PRD is self-contained — a fresh session with only that PRD has all the context needed to implement the phase.

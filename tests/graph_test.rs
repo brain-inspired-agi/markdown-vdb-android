@@ -1,0 +1,1282 @@
+use std::fs;
+use std::path::PathBuf;
+
+use mdvdb::config::{Config, EmbeddingProviderType};
+use mdvdb::{
+    ClusterAnalysisStatus, CustomClusterDef, GraphAnalysisContext, GraphLevel, IngestOptions,
+    MarkdownVdb, ShardStore, TopicAnalysisStatus, COMPACT_GRAPH_FORMAT, COMPACT_GRAPH_VERSION,
+};
+use tempfile::TempDir;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const DIMS: usize = 8;
+
+fn mock_config() -> Config {
+    Config {
+        embedding_provider: EmbeddingProviderType::Mock,
+        embedding_model: "mock-model".into(),
+        embedding_dimensions: DIMS,
+        embedding_batch_size: 100,
+        openai_api_key: None,
+        ollama_host: "http://localhost:11434".into(),
+        embedding_endpoint: None,
+        embedding_options: Default::default(),
+        source_dirs: vec![PathBuf::from(".")],
+        ignore_patterns: vec![],
+        watch_enabled: false,
+        watch_debounce_ms: 300,
+        chunk_max_tokens: 512,
+        chunk_overlap_tokens: 50,
+        clustering_enabled: false,
+        clustering_algorithm: mdvdb::config::ClusteringAlgorithm::Leiden,
+        clustering_knn: 15,
+        clustering_resolution: 1.0,
+        clustering_min_cluster_size: 2,
+        topics_min_similarity: 0.30,
+        clustering_rebalance_threshold: 50,
+        clustering_granularity: 1.0,
+        search_default_limit: 10,
+        search_min_score: 0.0,
+        search_default_mode: mdvdb::SearchMode::Hybrid,
+        search_rrf_k: 60.0,
+        bm25_norm_k: 1.5,
+        search_decay_enabled: false,
+        search_decay_half_life: 90.0,
+        search_decay_exclude: vec![],
+        search_decay_include: vec![],
+        search_boost_links: false,
+        search_boost_hops: 1,
+        search_expand_graph: 0,
+        search_expand_limit: 3,
+        vector_quantization: mdvdb::VectorQuantization::F16,
+        index_compression: true,
+        edge_embeddings: true,
+        edge_boost_weight: 0.15,
+        edge_cluster_rebalance: 50,
+        custom_cluster_defs: Vec::new(),
+    }
+}
+
+fn setup_dir() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".markdownvdb")).unwrap();
+    fs::write(
+        dir.path().join(".markdownvdb").join("config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\n",
+    )
+    .unwrap();
+    dir
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_graph_data_empty_index() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    let graph = vdb.graph_data(None).unwrap();
+
+    assert!(graph.nodes.is_empty(), "empty index should have no nodes");
+    assert!(graph.edges.is_empty(), "empty index should have no edges");
+    assert!(
+        graph.clusters.is_empty(),
+        "empty index should have no clusters"
+    );
+}
+
+#[tokio::test]
+async fn test_graph_data_with_files() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(root.join("a.md"), "# A\n\nContent of A.\n").unwrap();
+    fs::write(root.join("b.md"), "# B\n\nContent of B.\n").unwrap();
+    fs::write(root.join("c.md"), "# C\n\nContent of C.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph_data(None).unwrap();
+
+    assert_eq!(graph.nodes.len(), 3, "should have 3 nodes");
+    let paths: Vec<&str> = graph.nodes.iter().map(|n| n.path.as_str()).collect();
+    assert!(paths.contains(&"a.md"));
+    assert!(paths.contains(&"b.md"));
+    assert!(paths.contains(&"c.md"));
+
+    // No links between files, so no edges
+    assert!(graph.edges.is_empty(), "no links means no edges");
+}
+
+#[tokio::test]
+async fn test_graph_data_with_links() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(
+        root.join("a.md"),
+        "# A\n\nLink to [B](b.md) and [C](c.md).\n",
+    )
+    .unwrap();
+    fs::write(root.join("b.md"), "# B\n\nLink to [C](c.md).\n").unwrap();
+    fs::write(root.join("c.md"), "# C\n\nContent of C.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph_data(None).unwrap();
+
+    assert_eq!(graph.nodes.len(), 3);
+    assert_eq!(
+        graph.edges.len(),
+        3,
+        "should have 3 edges: a->b, a->c, b->c"
+    );
+
+    let edge_pairs: Vec<(&str, &str)> = graph
+        .edges
+        .iter()
+        .map(|e| (e.source.as_str(), e.target.as_str()))
+        .collect();
+    assert!(edge_pairs.contains(&("a.md", "b.md")));
+    assert!(edge_pairs.contains(&("a.md", "c.md")));
+    assert!(edge_pairs.contains(&("b.md", "c.md")));
+}
+
+#[tokio::test]
+async fn shard_graph_analysis_is_local_projected_and_index_immutable() {
+    let dir = setup_dir();
+    let root = dir.path();
+    fs::create_dir_all(root.join("docs/drafts")).unwrap();
+    fs::create_dir_all(root.join("docs/notes")).unwrap();
+    fs::create_dir_all(root.join("outside")).unwrap();
+    fs::write(
+        root.join(".markdownvdb/config.yaml"),
+        r#"
+embedding:
+  provider: mock
+  dimensions: 8
+shards:
+  docs:
+    name: Documents
+    path: docs
+    topics:
+      - name: Engineering
+        description: Engineering documents
+        seeds: [systems, design]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("docs/drafts/a.md"),
+        "# A\n\nSystems design draft linking [outside](../../outside/x.md).\n",
+    )
+    .unwrap();
+    fs::write(root.join("docs/notes/b.md"), "# B\n\nEngineering notes.\n").unwrap();
+    fs::write(root.join("docs/c.md"), "# C\n\nArchitecture.\n").unwrap();
+    fs::write(root.join("outside/x.md"), "# X\n\nOutside.\n").unwrap();
+
+    let mut config = mock_config();
+    config.clustering_enabled = true;
+    config.clustering_min_cluster_size = 1;
+    config.topics_min_similarity = 0.0;
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), config).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let index_path = root.join(".markdownvdb/index");
+    let index_before = fs::read(&index_path).unwrap();
+
+    let full = vdb.graph_data_for_shard("docs", None).unwrap();
+    assert_eq!(full.nodes.len(), 3);
+    assert!(full
+        .edges
+        .iter()
+        .all(|edge| edge.source.starts_with("docs/") && edge.target.starts_with("docs/")));
+    let info = full.analysis.as_ref().unwrap();
+    assert_eq!(info.context, GraphAnalysisContext::Shard);
+    assert_eq!(info.shard_id.as_deref(), Some("docs"));
+    assert_eq!(info.clusters, ClusterAnalysisStatus::Ready);
+    assert_eq!(info.topics, TopicAnalysisStatus::Ready);
+    assert_eq!(
+        full.clusters
+            .iter()
+            .map(|cluster| cluster.member_count)
+            .sum::<usize>(),
+        full.nodes.len()
+    );
+
+    // An ancestor clamps to the Shard; a descendant projects visibility but
+    // keeps the full-Shard cluster IDs; a disjoint folder is empty.
+    let ancestor = vdb.graph_data_for_shard("docs", Some(".")).unwrap();
+    assert_eq!(ancestor.nodes.len(), 3);
+    let descendant = vdb
+        .graph_data_for_shard("docs", Some("docs/drafts"))
+        .unwrap();
+    assert_eq!(descendant.nodes.len(), 1);
+    assert_eq!(descendant.nodes[0].path, "docs/drafts/a.md");
+    assert_eq!(
+        descendant
+            .clusters
+            .iter()
+            .map(|cluster| cluster.member_count)
+            .sum::<usize>(),
+        1
+    );
+    assert!(full
+        .nodes
+        .iter()
+        .find(|node| node.path == descendant.nodes[0].path)
+        .is_some_and(|node| node.cluster_id == descendant.nodes[0].cluster_id));
+    let disjoint = vdb.graph_data_for_shard("docs", Some("outside")).unwrap();
+    assert!(disjoint.nodes.is_empty());
+    assert!(disjoint.clusters.is_empty());
+    assert!(disjoint.custom_clusters.is_empty());
+
+    let compact = vdb
+        .graph_data_compact_for_shard("docs", Some("docs/drafts"))
+        .unwrap();
+    assert_eq!(compact.version, COMPACT_GRAPH_VERSION);
+    assert!(compact.analysis.is_some());
+
+    // Corpus-only staleness reuses this Shard's compatible centroids and
+    // reassigns against current vectors without ingest/provider access.
+    let cache_path = root.join(".markdownvdb/cache/shards/docs.json");
+    let mut cache: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+    cache["corpus_fingerprint"] = serde_json::Value::String("stale-corpus".to_string());
+    cache["topic_corpus_fingerprint"] = serde_json::Value::String("stale-topic-corpus".to_string());
+    fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let reassigned = vdb.graph_data_for_shard("docs", None).unwrap();
+    assert_eq!(
+        reassigned.analysis.as_ref().unwrap().topics,
+        TopicAnalysisStatus::Ready
+    );
+    let repaired: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+    assert_ne!(repaired["corpus_fingerprint"], "stale-corpus");
+    assert_ne!(repaired["topic_corpus_fingerprint"], "stale-topic-corpus");
+
+    // Editing a local definition invalidates only local Topic analysis. A
+    // read reports needs_ingest and must not invoke a provider or mutate the
+    // collection index.
+    ShardStore::new(root)
+        .update_topic(
+            "docs",
+            "Engineering",
+            CustomClusterDef {
+                name: "Engineering".to_string(),
+                description: Some("Changed definition".to_string()),
+                seeds: vec!["new seed".to_string()],
+                threshold: None,
+            },
+        )
+        .unwrap();
+    let stale = vdb.graph_data_for_shard("docs", None).unwrap();
+    assert_eq!(
+        stale.analysis.as_ref().unwrap().topics,
+        TopicAnalysisStatus::NeedsIngest
+    );
+    assert!(stale.custom_clusters.is_empty());
+
+    assert_eq!(fs::read(&index_path).unwrap(), index_before);
+    assert_eq!(mdvdb::index::storage::VERSION, 1);
+    assert_eq!(COMPACT_GRAPH_VERSION, 1);
+}
+
+#[tokio::test]
+async fn collection_topic_centroids_never_bootstrap_new_local_topics() {
+    let dir = setup_dir();
+    let root = dir.path();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(
+        root.join(".markdownvdb/config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\nshards:\n  docs:\n    name: Docs\n    path: docs\n",
+    )
+    .unwrap();
+    fs::write(root.join("docs/a.md"), "# A\n\nEngineering systems.\n").unwrap();
+    fs::write(root.join("docs/b.md"), "# B\n\nArchitecture design.\n").unwrap();
+
+    let definition = CustomClusterDef {
+        name: "Engineering".to_string(),
+        description: Some("Engineering documents".to_string()),
+        seeds: vec!["systems".to_string()],
+        threshold: None,
+    };
+    let mut config = mock_config();
+    config.topics_min_similarity = 0.0;
+    config.custom_cluster_defs = vec![definition.clone()];
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), config).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+    assert!(!vdb.custom_clusters().unwrap().is_empty());
+
+    // This definition happens to equal the collection Topic, but it was
+    // created after ingest. It remains needs_ingest instead of borrowing the
+    // collection centroid.
+    ShardStore::new(root).add_topic("docs", definition).unwrap();
+    let graph = vdb.graph_data_for_shard("docs", None).unwrap();
+    assert_eq!(
+        graph.analysis.as_ref().unwrap().topics,
+        TopicAnalysisStatus::NeedsIngest
+    );
+    assert!(graph.custom_clusters.is_empty());
+}
+
+#[tokio::test]
+async fn nested_shards_keep_independent_topics_and_analysis_corpora() {
+    let dir = setup_dir();
+    let root = dir.path();
+    fs::create_dir_all(root.join("research/methods")).unwrap();
+    fs::create_dir_all(root.join("research/other")).unwrap();
+    fs::write(
+        root.join(".markdownvdb/config.yaml"),
+        r#"
+embedding:
+  provider: mock
+  dimensions: 8
+shards:
+  research:
+    name: Research
+    path: research
+    topics:
+      - name: Focus
+        description: Broad research planning
+        seeds: [planning, roadmap]
+  methods:
+    name: Methods
+    path: research/methods
+    topics:
+      - name: Focus
+        description: Experimental methodology
+        seeds: [experiment, protocol]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("research/methods/a.md"),
+        "# A\n\nExperiment protocol.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("research/methods/b.md"),
+        "# B\n\nMethodology notes.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("research/other/c.md"),
+        "# C\n\nPlanning roadmap.\n",
+    )
+    .unwrap();
+
+    let mut config = mock_config();
+    config.clustering_enabled = true;
+    config.clustering_min_cluster_size = 1;
+    config.topics_min_similarity = 0.0;
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), config).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let parent = vdb.graph_data_for_shard("research", None).unwrap();
+    let child = vdb.graph_data_for_shard("methods", None).unwrap();
+    assert_eq!(parent.nodes.len(), 3);
+    assert_eq!(child.nodes.len(), 2);
+    assert_eq!(
+        parent.analysis.as_ref().unwrap().shard_id.as_deref(),
+        Some("research")
+    );
+    assert_eq!(
+        child.analysis.as_ref().unwrap().shard_id.as_deref(),
+        Some("methods")
+    );
+    assert!(child
+        .nodes
+        .iter()
+        .all(|node| node.path.starts_with("research/methods/")));
+
+    let parent_topics = vdb.custom_clusters_for_shard("research").unwrap();
+    let child_topics = vdb.custom_clusters_for_shard("methods").unwrap();
+    assert_eq!(parent_topics[0].name, "Focus");
+    assert_eq!(child_topics[0].name, "Focus");
+    assert_eq!(parent_topics[0].seed_phrases, vec!["planning", "roadmap"]);
+    assert_eq!(child_topics[0].seed_phrases, vec!["experiment", "protocol"]);
+
+    let read_cache = |id: &str| -> mdvdb::shard_analysis::ShardAnalysisCache {
+        serde_json::from_slice(
+            &fs::read(
+                root.join(".markdownvdb/cache/shards")
+                    .join(format!("{id}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let parent_cache = read_cache("research");
+    let child_cache = read_cache("methods");
+    let parent_topic_state = parent_cache.topics.unwrap();
+    let child_topic_state = child_cache.topics.unwrap();
+    assert_ne!(
+        parent_topic_state.clusters[0].centroid,
+        child_topic_state.clusters[0].centroid
+    );
+    assert_eq!(
+        parent_topic_state.clusters[0].members.len() + parent_topic_state.unassigned.len(),
+        3
+    );
+    assert_eq!(
+        child_topic_state.clusters[0].members.len() + child_topic_state.unassigned.len(),
+        2
+    );
+    assert!(parent_cache.clusters.is_some());
+    assert!(child_cache.clusters.is_some());
+}
+
+#[tokio::test]
+async fn ingest_preserves_prior_auto_state_until_lazy_recluster() {
+    let dir = setup_dir();
+    let root = dir.path();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(
+        root.join(".markdownvdb/config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\nshards:\n  docs:\n    name: Docs\n    path: docs\n",
+    )
+    .unwrap();
+    for name in ["a.md", "b.md", "c.md"] {
+        fs::write(root.join("docs").join(name), "Shared corpus content.\n").unwrap();
+    }
+
+    let mut config = mock_config();
+    config.clustering_enabled = true;
+    config.clustering_min_cluster_size = 1;
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), config).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+    let initial = vdb.graph_data_for_shard("docs", None).unwrap();
+    assert_eq!(initial.clusters.len(), 1);
+    let stable_id = initial.clusters[0].id;
+
+    let cache_path = root.join(".markdownvdb/cache/shards/docs.json");
+    let before: mdvdb::shard_analysis::ShardAnalysisCache =
+        serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+    fs::write(root.join("docs/d.md"), "Shared corpus content.\n").unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    // Topic refresh observes the new corpus but keeps the auto state and its
+    // old fingerprint available for stable-ID matching.
+    let after_ingest: mdvdb::shard_analysis::ShardAnalysisCache =
+        serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+    assert!(after_ingest.clusters.is_some());
+    assert_eq!(after_ingest.cluster_fingerprint, before.cluster_fingerprint);
+    assert_ne!(after_ingest.corpus_fingerprint, before.corpus_fingerprint);
+
+    let recomputed = vdb.graph_data_for_shard("docs", None).unwrap();
+    assert_eq!(recomputed.nodes.len(), 4);
+    assert!(recomputed
+        .clusters
+        .iter()
+        .any(|cluster| cluster.id == stable_id));
+    let after_graph: mdvdb::shard_analysis::ShardAnalysisCache =
+        serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+    assert_ne!(after_graph.cluster_fingerprint, before.cluster_fingerprint);
+}
+
+#[tokio::test]
+async fn lazy_shard_clustering_is_provider_free_and_does_not_mutate_the_index() {
+    let dir = setup_dir();
+    let root = dir.path();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(
+        root.join(".markdownvdb/config.yaml"),
+        "embedding:\n  provider: mock\n  dimensions: 8\nshards:\n  docs:\n    name: Docs\n    path: docs\n",
+    )
+    .unwrap();
+    fs::write(root.join("docs/a.md"), "# Alpha\n\nSystems design.\n").unwrap();
+    fs::write(root.join("docs/b.md"), "# Beta\n\nCooking recipe.\n").unwrap();
+
+    let mut ingest_config = mock_config();
+    ingest_config.clustering_enabled = true;
+    ingest_config.clustering_min_cluster_size = 1;
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), ingest_config).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+    drop(vdb);
+
+    // Force a lazy auto-cluster computation in a fresh read-only process.
+    // The deliberately unusable provider configuration proves the read does
+    // not try to initialize or call an embedding provider.
+    let cache_path = root.join(".markdownvdb/cache/shards/docs.json");
+    fs::remove_file(&cache_path).unwrap();
+    let index_path = root.join(".markdownvdb/index");
+    let index_before = fs::read(&index_path).unwrap();
+    let mut readonly_config = mock_config();
+    readonly_config.clustering_enabled = true;
+    readonly_config.clustering_min_cluster_size = 1;
+    readonly_config.embedding_provider = EmbeddingProviderType::OpenAI;
+    readonly_config.openai_api_key = None;
+    let readonly =
+        MarkdownVdb::open_readonly_with_config(root.to_path_buf(), readonly_config).unwrap();
+
+    let graph = readonly.graph_data_for_shard("docs", None).unwrap();
+    assert_eq!(graph.nodes.len(), 2);
+    assert_eq!(
+        graph.analysis.as_ref().unwrap().clusters,
+        ClusterAnalysisStatus::Ready
+    );
+    assert!(cache_path.exists());
+
+    // A pre-adaptive-KNN cache fingerprint must be treated as disposable
+    // stale state and replaced on the next lazy read.
+    let mut stale_cache: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+    stale_cache["cluster_fingerprint"] = serde_json::json!("legacy-cluster-recipe");
+    stale_cache["cluster_settings_fingerprint"] = serde_json::json!("legacy-settings-recipe");
+    fs::write(&cache_path, serde_json::to_vec(&stale_cache).unwrap()).unwrap();
+    let recomputed = readonly.graph_data_for_shard("docs", None).unwrap();
+    assert_eq!(
+        recomputed.analysis.as_ref().unwrap().clusters,
+        ClusterAnalysisStatus::Ready
+    );
+    let repaired_cache: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+    assert_ne!(
+        repaired_cache["cluster_fingerprint"],
+        "legacy-cluster-recipe"
+    );
+    assert_ne!(
+        repaired_cache["cluster_settings_fingerprint"],
+        "legacy-settings-recipe"
+    );
+    assert_eq!(fs::read(index_path).unwrap(), index_before);
+}
+
+#[tokio::test]
+async fn test_graph_data_filters_broken_edges() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    // a links to b (exists) and nonexistent (doesn't exist)
+    fs::write(
+        root.join("a.md"),
+        "# A\n\nLink to [B](b.md) and [missing](nonexistent.md).\n",
+    )
+    .unwrap();
+    fs::write(root.join("b.md"), "# B\n\nContent of B.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph_data(None).unwrap();
+
+    assert_eq!(graph.nodes.len(), 2);
+    // Only a->b edge should exist; a->nonexistent should be filtered out
+    assert_eq!(
+        graph.edges.len(),
+        1,
+        "broken edge to nonexistent.md should be filtered"
+    );
+    assert_eq!(graph.edges[0].source, "a.md");
+    assert_eq!(graph.edges[0].target, "b.md");
+}
+
+#[tokio::test]
+async fn test_graph_data_no_clusters() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(root.join("a.md"), "# A\n\nContent.\n").unwrap();
+    fs::write(root.join("b.md"), "# B\n\nContent.\n").unwrap();
+
+    // clustering_enabled is false in mock_config
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph_data(None).unwrap();
+
+    assert_eq!(graph.nodes.len(), 2);
+    assert!(
+        graph.clusters.is_empty(),
+        "no clusters when clustering disabled"
+    );
+    for node in &graph.nodes {
+        assert!(
+            node.cluster_id.is_none(),
+            "node {} should have no cluster_id",
+            node.path
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chunk graph tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_chunk_graph_empty_index() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    let graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+
+    assert!(graph.nodes.is_empty(), "empty index should have no nodes");
+    assert!(graph.edges.is_empty(), "empty index should have no edges");
+    assert_eq!(graph.level, "chunk");
+}
+
+#[tokio::test]
+async fn test_chunk_graph_cross_file_edges() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(root.join("a.md"), "# Alpha\n\nAlpha content here.\n").unwrap();
+    fs::write(root.join("b.md"), "# Beta\n\nBeta content here.\n").unwrap();
+    fs::write(root.join("c.md"), "# Gamma\n\nGamma content here.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+
+    assert_eq!(graph.level, "chunk");
+    assert!(graph.nodes.len() >= 3, "should have at least 3 chunk nodes");
+
+    // All edges must connect chunks from different files
+    for edge in &graph.edges {
+        let src_node = graph.nodes.iter().find(|n| n.id == edge.source).unwrap();
+        let tgt_node = graph.nodes.iter().find(|n| n.id == edge.target).unwrap();
+        assert_ne!(
+            src_node.path, tgt_node.path,
+            "edge {}->{} connects chunks from the same file {}",
+            edge.source, edge.target, src_node.path
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_chunk_graph_nodes_have_stable_id_order() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(root.join("z.md"), "# Zeta\n\nZeta content.\n").unwrap();
+    fs::write(root.join("a.md"), "# Alpha\n\nAlpha content.\n").unwrap();
+    fs::write(root.join("m.md"), "# Middle\n\nMiddle content.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+    let ids: Vec<&str> = graph.nodes.iter().map(|node| node.id.as_str()).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+
+    assert_eq!(ids, sorted);
+}
+
+#[tokio::test]
+async fn test_chunk_graph_no_intra_file_edges() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    // Single file with multiple headings → multiple chunks
+    fs::write(
+        root.join("multi.md"),
+        "# Section One\n\nFirst section content.\n\n# Section Two\n\nSecond section content.\n\n# Section Three\n\nThird section content.\n",
+    )
+    .unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+
+    // Multiple chunks from the same file
+    assert!(
+        graph.nodes.len() >= 2,
+        "multi-heading file should produce multiple chunk nodes, got {}",
+        graph.nodes.len()
+    );
+
+    // No edges since all chunks are from the same file
+    assert!(
+        graph.edges.is_empty(),
+        "single-file chunks should produce no edges, got {}",
+        graph.edges.len()
+    );
+}
+
+#[tokio::test]
+async fn test_chunk_graph_heading_labels() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(
+        root.join("doc.md"),
+        "# Main Title\n\nIntro.\n\n## Sub Section\n\nDetails.\n",
+    )
+    .unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+
+    assert!(!graph.nodes.is_empty(), "should have chunk nodes");
+
+    for node in &graph.nodes {
+        // Every chunk node should have a label (heading hierarchy or fallback)
+        assert!(
+            node.label.is_some(),
+            "chunk node {} should have a label",
+            node.id
+        );
+        let label = node.label.as_ref().unwrap();
+        assert!(
+            !label.is_empty(),
+            "label should not be empty for {}",
+            node.id
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_chunk_graph_no_heading_labels() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    // Content without any headings — chunks should have label = None
+    fs::write(
+        root.join("plain.md"),
+        "Just some plain text without headings.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("other.md"),
+        "Another file with no headings at all.\n",
+    )
+    .unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+
+    assert!(!graph.nodes.is_empty(), "should have chunk nodes");
+
+    for node in &graph.nodes {
+        // Without headings, label should be None
+        assert!(
+            node.label.is_none(),
+            "chunk node {} from file without headings should have label = None",
+            node.id
+        );
+        // chunk_index should still be set
+        assert!(
+            node.chunk_index.is_some(),
+            "chunk node {} should have chunk_index",
+            node.id
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_chunk_graph_edge_weights() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(root.join("x.md"), "# X\n\nContent about X.\n").unwrap();
+    fs::write(root.join("y.md"), "# Y\n\nContent about Y.\n").unwrap();
+    fs::write(root.join("z.md"), "# Z\n\nContent about Z.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+
+    for edge in &graph.edges {
+        assert!(
+            edge.weight.is_some(),
+            "chunk edge {}->{} should have a weight",
+            edge.source,
+            edge.target
+        );
+        let w = edge.weight.unwrap();
+        assert!(
+            (0.0..=1.0).contains(&w),
+            "weight {} should be in 0.0-1.0 for edge {}->{}",
+            w,
+            edge.source,
+            edge.target
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_chunk_graph_single_file() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(root.join("only.md"), "# Only File\n\nSome content.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+
+    assert!(
+        !graph.nodes.is_empty(),
+        "single file should still produce chunk nodes"
+    );
+    assert!(
+        graph.edges.is_empty(),
+        "single file should have zero edges (no cross-file connections)"
+    );
+}
+
+#[tokio::test]
+async fn test_graph_dispatcher() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(root.join("a.md"), "# A\n\nContent of A.\n").unwrap();
+    fs::write(root.join("b.md"), "# B\n\nContent of B.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    // Document level should match graph_data()
+    let doc_graph = vdb.graph(GraphLevel::Document, None).unwrap();
+    let direct_graph = vdb.graph_data(None).unwrap();
+    assert_eq!(doc_graph.level, "document");
+    assert_eq!(doc_graph.nodes.len(), direct_graph.nodes.len());
+    assert_eq!(doc_graph.edges.len(), direct_graph.edges.len());
+
+    // Chunk level should return chunk-level data
+    let chunk_graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+    assert_eq!(chunk_graph.level, "chunk");
+    // Chunk nodes have chunk_index set
+    for node in &chunk_graph.nodes {
+        assert!(
+            node.chunk_index.is_some(),
+            "chunk-level node {} should have chunk_index",
+            node.id
+        );
+    }
+
+    let compact_chunk_graph = vdb.graph_compact(GraphLevel::Chunk, None).unwrap();
+    assert_eq!(compact_chunk_graph.format, COMPACT_GRAPH_FORMAT);
+    assert_eq!(compact_chunk_graph.version, COMPACT_GRAPH_VERSION);
+    assert_eq!(compact_chunk_graph.level, "chunk");
+    assert!(
+        compact_chunk_graph.contexts.is_empty(),
+        "similarity edges do not carry paragraph contexts"
+    );
+    assert!(compact_chunk_graph
+        .edges
+        .iter()
+        .all(|edge| edge.context_index.is_none()));
+}
+
+#[tokio::test]
+async fn test_graph_data_backward_compat() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(root.join("a.md"), "# A\n\nLink to [B](b.md).\n").unwrap();
+    fs::write(root.join("b.md"), "# B\n\nContent.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph_data(None).unwrap();
+
+    // New fields should have backward-compatible defaults
+    assert_eq!(graph.level, "document");
+
+    for node in &graph.nodes {
+        // id should be set to the path
+        assert_eq!(node.id, node.path, "document node id should equal path");
+        // label and chunk_index should be None for document-level
+        assert!(node.label.is_none(), "document node should have no label");
+        assert!(
+            node.chunk_index.is_none(),
+            "document node should have no chunk_index"
+        );
+    }
+
+    for edge in &graph.edges {
+        // weight should be None for link-based document edges
+        assert!(edge.weight.is_none(), "document edge should have no weight");
+    }
+}
+
+#[tokio::test]
+async fn test_compact_document_graph_interns_full_contexts_losslessly() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    // Both links share one paragraph, so their semantic edge contexts are
+    // byte-for-byte identical and should occupy one string-table entry.
+    fs::write(
+        root.join("a.md"),
+        "# A\n\nThe same paragraph links to [B](b.md) and [C](c.md) for details.\n",
+    )
+    .unwrap();
+    fs::write(root.join("b.md"), "# B\n\nContent.\n").unwrap();
+    fs::write(root.join("c.md"), "# C\n\nContent.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let regular = vdb.graph_data(None).unwrap();
+    let compact = vdb.graph_data_compact(None).unwrap();
+
+    assert_eq!(compact.format, COMPACT_GRAPH_FORMAT);
+    assert_eq!(compact.version, COMPACT_GRAPH_VERSION);
+    assert_eq!(compact.nodes.len(), regular.nodes.len());
+    assert_eq!(compact.edges.len(), regular.edges.len());
+    assert_eq!(
+        compact.contexts.len(),
+        1,
+        "shared context should be interned once"
+    );
+
+    for edge in &compact.edges {
+        let regular_edge = regular
+            .edges
+            .iter()
+            .find(|candidate| {
+                candidate.source == edge.source
+                    && candidate.target == edge.target
+                    && candidate.field == edge.field
+            })
+            .expect("compact edge must have a regular-contract counterpart");
+        let reconstructed = edge.context_index.map(|index| {
+            compact
+                .contexts
+                .get(index)
+                .expect("context index must reference the response string table")
+        });
+        assert_eq!(reconstructed, regular_edge.context_text.as_ref());
+    }
+
+    let serialized = serde_json::to_value(&compact).unwrap();
+    for edge in serialized["edges"].as_array().unwrap() {
+        assert!(
+            edge.get("context_text").is_none(),
+            "compact edges must not repeat full context strings"
+        );
+        assert!(
+            edge["context_index"].is_u64(),
+            "semantic edge should reference the context table"
+        );
+        assert!(edge.get("field").is_some(), "field remains always-present");
+    }
+}
+
+#[tokio::test]
+async fn test_compact_document_graph_only_interns_contexts_in_filtered_topology() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(
+        root.join("docs/a.md"),
+        "# A\n\nIncluded context links to [B](b.md).\n",
+    )
+    .unwrap();
+    fs::write(root.join("docs/b.md"), "# B\n\nContent.\n").unwrap();
+    fs::write(
+        root.join("outside.md"),
+        "# Outside\n\nExcluded context links to [A](docs/a.md).\n",
+    )
+    .unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let compact = vdb.graph_data_compact(Some("docs/")).unwrap();
+
+    assert_eq!(compact.edges.len(), 1);
+    assert_eq!(compact.contexts.len(), 1);
+    assert!(compact.contexts[0].contains("Included context"));
+    assert!(!compact.contexts[0].contains("Excluded context"));
+}
+
+// ---------------------------------------------------------------------------
+// Cluster inheritance tests
+// ---------------------------------------------------------------------------
+
+fn mock_config_clustering() -> Config {
+    let mut cfg = mock_config();
+    cfg.clustering_enabled = true;
+    cfg
+}
+
+#[tokio::test]
+async fn test_chunk_graph_cluster_inheritance() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    // Need enough files for clustering to produce clusters
+    fs::write(root.join("a.md"), "# A\n\nRust programming language.\n").unwrap();
+    fs::write(root.join("b.md"), "# B\n\nPython data science.\n").unwrap();
+    fs::write(root.join("c.md"), "# C\n\nJavaScript frontend.\n").unwrap();
+    fs::write(root.join("d.md"), "# D\n\nDatabase optimization.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config_clustering()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let chunk_graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+    let doc_graph = vdb.graph_data(None).unwrap();
+
+    // Chunk nodes should inherit cluster_id from their parent document
+    for chunk_node in &chunk_graph.nodes {
+        let doc_node = doc_graph.nodes.iter().find(|n| n.path == chunk_node.path);
+        if let Some(doc) = doc_node {
+            assert_eq!(
+                chunk_node.cluster_id, doc.cluster_id,
+                "chunk {} should inherit cluster_id from parent doc {}",
+                chunk_node.id, chunk_node.path
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_chunk_graph_clusters_populated() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(root.join("a.md"), "# A\n\nRust programming.\n").unwrap();
+    fs::write(root.join("b.md"), "# B\n\nPython science.\n").unwrap();
+    fs::write(root.join("c.md"), "# C\n\nJavaScript frontend.\n").unwrap();
+    fs::write(root.join("d.md"), "# D\n\nDatabase SQL.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config_clustering()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let chunk_graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+
+    // clusters vec should be non-empty when clustering is enabled
+    assert!(
+        !chunk_graph.clusters.is_empty(),
+        "chunk graph should return populated clusters"
+    );
+
+    // Each cluster should have valid fields
+    for cluster in &chunk_graph.clusters {
+        assert!(
+            !cluster.label.is_empty(),
+            "cluster label should not be empty"
+        );
+        assert!(cluster.member_count > 0, "cluster should have members");
+    }
+}
+
+#[tokio::test]
+async fn test_chunk_graph_no_clusters_fallback() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::write(root.join("a.md"), "# A\n\nContent.\n").unwrap();
+    fs::write(root.join("b.md"), "# B\n\nContent.\n").unwrap();
+
+    // clustering_enabled is false in mock_config
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let chunk_graph = vdb.graph(GraphLevel::Chunk, None).unwrap();
+
+    assert!(
+        chunk_graph.clusters.is_empty(),
+        "clusters should be empty when clustering disabled"
+    );
+    for node in &chunk_graph.nodes {
+        assert!(
+            node.cluster_id.is_none(),
+            "chunk node {} should have no cluster_id when clustering disabled",
+            node.id
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path filter tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_graph_data_path_filter() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(root.join("docs-old")).unwrap();
+    fs::write(root.join("docs/guide.md"), "# Guide\n\nGuide content.\n").unwrap();
+    fs::write(root.join("docs/api.md"), "# API\n\nAPI reference.\n").unwrap();
+    fs::write(
+        root.join("docs-old/archive.md"),
+        "# Archive\n\nOld documentation.\n",
+    )
+    .unwrap();
+    fs::write(root.join("readme.md"), "# Readme\n\nTop-level readme.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph_data(Some("docs")).unwrap();
+
+    assert_eq!(graph.nodes.len(), 2, "only docs/ files should be included");
+    for node in &graph.nodes {
+        assert!(
+            node.path.starts_with("docs/"),
+            "node {} should start with docs/",
+            node.path
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_chunk_graph_path_filter() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(root.join("docs-old")).unwrap();
+    fs::write(
+        root.join("docs/guide.md"),
+        "# Guide\n\nGuide content here.\n",
+    )
+    .unwrap();
+    fs::write(root.join("docs/api.md"), "# API\n\nAPI reference docs.\n").unwrap();
+    fs::write(
+        root.join("docs-old/archive.md"),
+        "# Archive\n\nOld documentation.\n",
+    )
+    .unwrap();
+    fs::write(root.join("readme.md"), "# Readme\n\nTop-level readme.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph(GraphLevel::Chunk, Some("docs")).unwrap();
+
+    assert!(
+        !graph.nodes.is_empty(),
+        "should have chunk nodes from docs/"
+    );
+    for node in &graph.nodes {
+        assert!(
+            node.path.starts_with("docs/"),
+            "chunk node {} has path {} outside docs/",
+            node.id,
+            node.path
+        );
+    }
+    let node_ids: std::collections::HashSet<&str> =
+        graph.nodes.iter().map(|node| node.id.as_str()).collect();
+    assert!(graph.edges.iter().all(|edge| {
+        node_ids.contains(edge.source.as_str()) && node_ids.contains(edge.target.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn test_graph_path_filter_edges() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("docs")).unwrap();
+    // docs/a links to docs/b (both in filter) and to root.md (outside filter)
+    fs::write(
+        root.join("docs/a.md"),
+        "# A\n\nLink to [B](../docs/b.md) and [root](../root.md).\n",
+    )
+    .unwrap();
+    fs::write(root.join("docs/b.md"), "# B\n\nContent.\n").unwrap();
+    fs::write(root.join("root.md"), "# Root\n\nRoot content.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph = vdb.graph_data(Some("docs/")).unwrap();
+
+    // Only nodes from docs/
+    assert_eq!(graph.nodes.len(), 2);
+    // Edges should only include those where both endpoints are in docs/
+    for edge in &graph.edges {
+        assert!(
+            edge.source.starts_with("docs/"),
+            "edge source {} should be in docs/",
+            edge.source
+        );
+        assert!(
+            edge.target.starts_with("docs/"),
+            "edge target {} should be in docs/",
+            edge.target
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_graph_path_filter_none() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("docs/guide.md"), "# Guide\n\nGuide.\n").unwrap();
+    fs::write(root.join("readme.md"), "# Readme\n\nReadme.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    let graph_all = vdb.graph_data(None).unwrap();
+    assert_eq!(
+        graph_all.nodes.len(),
+        2,
+        "None filter should return all files"
+    );
+
+    let paths: Vec<&str> = graph_all.nodes.iter().map(|n| n.path.as_str()).collect();
+    assert!(paths.contains(&"docs/guide.md"));
+    assert!(paths.contains(&"readme.md"));
+}
+
+#[tokio::test]
+async fn test_graph_dispatcher_path_filter() {
+    let dir = setup_dir();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.md"), "# Main\n\nMain module.\n").unwrap();
+    fs::write(root.join("src/lib.md"), "# Lib\n\nLib module.\n").unwrap();
+    fs::write(root.join("readme.md"), "# Readme\n\nTop level.\n").unwrap();
+
+    let vdb = MarkdownVdb::open_with_config(root.to_path_buf(), mock_config()).unwrap();
+    vdb.ingest(IngestOptions::default()).await.unwrap();
+
+    // Document level with path filter
+    let doc_graph = vdb.graph(GraphLevel::Document, Some("src/")).unwrap();
+    assert_eq!(
+        doc_graph.nodes.len(),
+        2,
+        "document graph should have 2 src/ nodes"
+    );
+    for node in &doc_graph.nodes {
+        assert!(node.path.starts_with("src/"));
+    }
+
+    // Chunk level with path filter
+    let chunk_graph = vdb.graph(GraphLevel::Chunk, Some("src/")).unwrap();
+    assert!(
+        !chunk_graph.nodes.is_empty(),
+        "chunk graph should have src/ nodes"
+    );
+    for node in &chunk_graph.nodes {
+        assert!(
+            node.path.starts_with("src/"),
+            "chunk node {} should be in src/",
+            node.id
+        );
+    }
+}
