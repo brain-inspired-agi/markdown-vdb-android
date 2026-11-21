@@ -2404,7 +2404,7 @@ async fn run() -> anyhow::Result<()> {
             let dir = args.dir.canonicalize()?;
             let mut md_files: Vec<_> = std::fs::read_dir(&dir)?
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "md" || ext == "py"))
                 .map(|e| e.file_name().into())
                 .collect::<Vec<std::path::PathBuf>>();
             md_files.sort();

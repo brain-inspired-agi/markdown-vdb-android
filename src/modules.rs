@@ -481,6 +481,7 @@ impl ModuleRunLock {
 /// This is public so trusted frontends can keep an overlay mutation and the
 /// immediately following module pipeline inside one cross-process critical
 /// section. Callers must not hold it across unrelated user interaction.
+#[allow(unreachable_code, unused_variables)]
 pub fn acquire_module_run_lock(project_root: &Path) -> crate::Result<ModuleRunLock> {
     use std::time::Duration;
 

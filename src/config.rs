@@ -577,6 +577,9 @@ impl Config {
                 return Some(PathBuf::from(custom));
             }
         }
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() { return Some(PathBuf::from(home).join(".mdvdb")); }
+        }
         dirs::home_dir().map(|h| h.join(".mdvdb"))
     }
 
@@ -1586,6 +1589,7 @@ pub(crate) struct ConfigLockGuard {
 /// `.markdownvdb/config.lock`. The same helper is used by settings, topic, and
 /// Shard mutations so independent mdvdb processes cannot overwrite each
 /// other's read-modify-write operations.
+#[allow(unreachable_code, unused_variables)]
 pub(crate) fn acquire_config_lock(path: &Path) -> Result<ConfigLockGuard, Error> {
     use std::fs::{self, OpenOptions};
     use std::time::Duration;
@@ -1629,6 +1633,19 @@ pub(crate) fn acquire_config_lock(path: &Path) -> Result<ConfigLockGuard, Error>
                 return Err(Error::ConfigBusy {
                     path: path.to_path_buf(),
                 });
+            }
+            #[cfg(target_os = "android")]
+            Err(std::fs::TryLockError::Error(ref e)) if e.kind() == std::io::ErrorKind::Unsupported => {
+                for _ in 0..ATTEMPTS {
+                    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+                        Ok(lock_file) => return Ok(ConfigLockGuard { _file: lock_file }),
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            std::thread::sleep(RETRY_DELAY);
+                        }
+                        Err(err) => return Err(Error::Config(format!("lock error: {err}"))),
+                    }
+                }
+                return Err(Error::Config("Config lock timeout".into()));
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(Error::Io(e)),
         }

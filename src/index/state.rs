@@ -1303,6 +1303,7 @@ impl Index {
 /// [`Error::IndexBusy`]. The lock is released when the returned `File` is
 /// dropped (the OS releases advisory locks on close), so callers hold it
 /// only for the write critical section by scoping the returned handle.
+#[allow(unreachable_code, unused_variables)]
 fn acquire_write_lock(index_path: &Path) -> Result<std::fs::File> {
     const ATTEMPTS: usize = 10;
     const RETRY_DELAY_MS: u64 = 200;
@@ -1327,6 +1328,19 @@ fn acquire_write_lock(index_path: &Path) -> Result<std::fs::File> {
                 if attempt + 1 < ATTEMPTS {
                     std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
                 }
+            }
+            #[cfg(target_os = "android")]
+            Err(std::fs::TryLockError::Error(ref e)) if e.kind() == std::io::ErrorKind::Unsupported => {
+                for _ in 0..ATTEMPTS {
+                    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+                        Ok(lock_file) => return Ok(lock_file),
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                        }
+                        Err(err) => return Err(Error::Io(err)),
+                    }
+                }
+                return Err(Error::IndexBusy { path: index_path.to_path_buf() });
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(Error::Io(e)),
         }

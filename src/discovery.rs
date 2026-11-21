@@ -100,7 +100,7 @@ impl FileDiscovery {
                 if !path.is_file() {
                     continue;
                 }
-                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                if !matches!(path.extension().and_then(|e| e.to_str()), Some("md" | "py")) {
                     continue;
                 }
 
@@ -129,7 +129,7 @@ impl FileDiscovery {
     /// Used by the file watcher to filter filesystem events.
     pub fn should_index(&self, relative_path: &Path) -> bool {
         // Must have .md extension
-        if relative_path.extension().and_then(|e| e.to_str()) != Some("md") {
+        if !matches!(relative_path.extension().and_then(|e| e.to_str()), Some("md" | "py")) {
             return false;
         }
 

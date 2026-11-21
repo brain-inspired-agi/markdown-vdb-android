@@ -1,6 +1,6 @@
 [package]
 name = "mdvdb"
-version = "0.2.0"
+version = "0.2.0-android"
 edition = "2021"
 
 [[bin]]

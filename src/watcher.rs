@@ -864,7 +864,7 @@ fn classify_event(
                     }
                     (Some(from), None) => {
                         // Renamed to non-indexable path = delete
-                        if from.extension().and_then(|e| e.to_str()) == Some("md") {
+                        if matches!(from.extension().and_then(|e| e.to_str()), Some("md" | "py")) {
                             result.push(FileEvent::Deleted(from.to_path_buf()));
                         }
                     }
@@ -881,7 +881,7 @@ fn classify_event(
                 if let Some(rel) = schema_relative(path) {
                     result.push(FileEvent::SchemaChanged(rel));
                 } else if let Ok(rel) = path.strip_prefix(project_root) {
-                    if rel.extension().and_then(|e| e.to_str()) == Some("md") {
+                    if matches!(rel.extension().and_then(|e| e.to_str()), Some("md" | "py")) {
                         result.push(FileEvent::Deleted(rel.to_path_buf()));
                     }
                 }
@@ -912,7 +912,7 @@ fn classify_event(
                 if let Some(rel) = schema_relative(path) {
                     result.push(FileEvent::SchemaChanged(rel));
                 } else if let Ok(rel) = path.strip_prefix(project_root) {
-                    if rel.extension().and_then(|e| e.to_str()) == Some("md") {
+                    if matches!(rel.extension().and_then(|e| e.to_str()), Some("md" | "py")) {
                         result.push(FileEvent::Deleted(rel.to_path_buf()));
                     }
                 }
